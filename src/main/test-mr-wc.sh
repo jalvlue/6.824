@@ -43,15 +43,11 @@ then
 fi
 
 # run the test in a fresh sub-directory.
-rm -rf mr-tmp
-mkdir mr-tmp || exit 1
 cd mr-tmp || exit 1
-rm -f mr-*
 
-(cd .. && go build $RACE mrcoordinator.go) || exit 1
-(cd .. && go build $RACE mrworker.go) || exit 1
-(cd .. && go build $RACE mrsequential.go) || exit 1
-
+(cd .. && go build -race mrcoordinator.go) || exit 1
+(cd .. && go build -race mrworker.go) || exit 1
+(cd .. && go build -buildmode=plugin -race ../mrapps/wc.go) || exit 1
 
 failed_any=0
 
@@ -87,4 +83,4 @@ fi
 # wait for remaining workers and coordinator to exit.
 wait
 
-rm -f mr-*
+rm -f mr-inter-* mr-out-*

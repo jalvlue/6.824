@@ -37,45 +37,60 @@ func Worker(
 	mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string,
 ) {
+	// uncomment to send the Example RPC to the coordinator.
+	CallExample()
 
 	// Your worker implementation here.
-
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
-
-	reply := askToMap()
-	filename := reply.fileName
-	nReduce := reply.nReduce
-	mapTaskID := reply.mapTaskID
-
-	// failed to ask for map task
-	// try to ask for reduce task
-	if filename == "" {
-		var reduceTaskID int
-		filename, reduceTaskID = askToReduce()
-		if filename == "" {
-			fmt.Println("No reduce tasks to do")
-		} else {
-			// do reduce task
-			doReduceTask(filename, reduceTaskID, reducef)
+	for {
+		reply, ok := askToMap()
+		if !ok {
+			fmt.Println("cannot contact the coordinator")
+			return
 		}
-	} else {
-		// do map task
-		doMapTask(filename, nReduce, mapTaskID, mapf)
+
+		filename := reply.FileName
+		nReduce := reply.NReduce
+		mapTaskID := reply.TaskID
+
+		// failed to ask for map task
+		// try to ask for reduce task
+		if filename == "" {
+			var reduceTaskID int
+			filename, reduceTaskID, ok = askToReduce()
+			if !ok {
+				fmt.Println("cannot contact the coordinator")
+				return
+			}
+
+			if filename == "" {
+				fmt.Println("No reduce tasks to do")
+				break
+			} else {
+				// do reduce task
+				doReduceTask(filename, reduceTaskID, reducef)
+			}
+		} else {
+			// do map task
+			doMapTask(filename, nReduce, mapTaskID, mapf)
+		}
 	}
+
 }
 
-func askToMap() askToMapReply {
-	reply := askToMapReply{}
+func askToMap() (Reply, bool) {
+	args := Args{}
+	args.TaskType = "map"
+	reply := Reply{}
 
-	ok := call("Coordinator.AssignMapTask", struct{}{}, &reply)
+	//ok := call("Coordinator.Example", &args, &reply)
+	ok := call("Coordinator.AssignMapTask", &args, &reply)
 	if ok {
-		fmt.Printf("reply.FileName %v\n", reply.fileName)
+		fmt.Printf("reply.FileName %v\n", reply.FileName)
 	} else {
 		fmt.Printf("call failed!\n")
 	}
 
-	return reply
+	return reply, ok
 }
 
 func noticeFinishMap(mapTaskID int) {
@@ -89,17 +104,17 @@ func noticeFinishMap(mapTaskID int) {
 	}
 }
 
-func askToReduce() (string, int) {
-	reply := askToReduceReply{}
+func askToReduce() (string, int, bool) {
+	reply := Reply{}
 
 	ok := call("Coordinator.AssignReduceTask", struct{}{}, &reply)
 	if ok {
-		fmt.Printf("reply.FileName %v\n", reply.fileName)
+		fmt.Printf("reply.FileName %v\n", reply.FileName)
 	} else {
 		fmt.Printf("call failed!\n")
 	}
 
-	return reply.fileName, reply.reduceTaskID
+	return reply.FileName, reply.TaskID, ok
 }
 
 func noticeFinishReduce(reduceTaskID int) {
@@ -114,6 +129,8 @@ func noticeFinishReduce(reduceTaskID int) {
 }
 
 func doMapTask(filename string, nReduce int, mapTaskID int, mapf func(string, string) []KeyValue) {
+
+	// read kvs from file
 	file, err := os.Open(filename)
 	if err != nil {
 		log.Fatalf("cannot open %v", filename)
@@ -126,13 +143,16 @@ func doMapTask(filename string, nReduce int, mapTaskID int, mapf func(string, st
 	kva := mapf(filename, string(content))
 	intermediate := [10][]KeyValue{}
 	for _, kv := range kva {
-		intermediate[ihash(kv.Key)%nReduce] = append(intermediate[ihash(kv.Key)%nReduce], kv)
+		rNum := ihash(kv.Key) % nReduce
+		intermediate[rNum] = append(intermediate[rNum], kv)
 	}
+
+	// write intermediate kvs to file
 	for i, inter := range intermediate {
-		oname := fmt.Sprintf("mr-%v-%v", mapTaskID, i)
-		ofile, err := os.Open(oname)
+		oname := fmt.Sprintf("mr-inter-%v", i)
+		ofile, err := os.OpenFile(oname, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
-			ofile, _ = os.Create(oname)
+			log.Fatal(err)
 		}
 		enc := json.NewEncoder(ofile)
 		for _, kv := range inter {

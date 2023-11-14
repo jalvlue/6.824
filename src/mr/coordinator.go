@@ -1,11 +1,13 @@
 package mr
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"net/rpc"
 	"os"
+	"sync"
 )
 
 type Coordinator struct {
@@ -13,48 +15,83 @@ type Coordinator struct {
 	mapTasks    []task
 	reduceTasks []task
 	nReduce     int
-	workerState []int
+	canReduce   bool
+	mux         sync.Mutex
 }
 
+// finished: 0: not finished, 1: on going, 2: finished
 type task struct {
 	fileName string
-	finished bool
+	finished byte
 	taskID   int
 }
 
-// Your code here -- RPC handlers for the worker to call.
-func (c *Coordinator) AssignMapTask(args interface{}, mReply *askToMapReply) error {
-	for _, task := range c.mapTasks {
-		if !task.finished {
-			mReply.fileName = task.fileName
-			mReply.nReduce = c.nReduce
-			mReply.mapTaskID = task.taskID
+func (c *Coordinator) AssignMapTask(args *Args, reply *Reply) error {
+	fmt.Println("try AssignMapTask call")
+	c.mux.Lock()
+	defer c.mux.Unlock()
+	for i, task := range c.mapTasks {
+		if task.finished == 0 {
+			reply.FileName = task.fileName
+			reply.NReduce = c.nReduce
+			reply.TaskType = args.TaskType
+			reply.TaskID = task.taskID
+			fmt.Println("assigned task:", task.fileName)
+
+			c.mapTasks[i].finished = 1
 			return nil
 		}
 	}
-	mReply.fileName = ""
+	reply.FileName = ""
+	fmt.Println("all map tasks finished")
 	return nil
 }
 
-func (c *Coordinator) AssignReduceTask(args interface{}, rReply *askToReduceReply) error {
-	for _, task := range c.reduceTasks {
-		if !task.finished {
-			rReply.fileName = task.fileName
-			rReply.reduceTaskID = task.taskID
+func (c *Coordinator) AssignReduceTask(args *Args, rReply *Reply) error {
+	fmt.Println("try AssignReduceTask call")
+	c.mux.Lock()
+	defer c.mux.Unlock()
+	if !c.canReduce {
+		rReply.FileName = ""
+		fmt.Println("not ready to reduce")
+		return nil
+	}
+
+	for i, task := range c.reduceTasks {
+		if task.finished == 0 {
+			rReply.FileName = task.fileName
+			rReply.TaskType = args.TaskType
+			rReply.TaskID = task.taskID
+			fmt.Println("assigned task:", task.fileName)
+
+			c.reduceTasks[i].finished = 1
 			return nil
 		}
 	}
-	rReply.fileName = ""
+	rReply.FileName = ""
+	fmt.Println("all reduce tasks finished")
 	return nil
 }
 
 func (c *Coordinator) FinishMapTask(mapTaskID int, reply *struct{}) error {
-	c.mapTasks[mapTaskID].finished = true
+	c.mux.Lock()
+	defer c.mux.Unlock()
+	c.mapTasks[mapTaskID].finished = 2
+
+	for _, task := range c.mapTasks {
+		if task.finished != 2 {
+			return nil
+		}
+	}
+
+	c.canReduce = true
 	return nil
 }
 
 func (c *Coordinator) FinishReduceTask(reduceTaskID int, reply *struct{}) error {
-	c.reduceTasks[reduceTaskID].finished = true
+	c.mux.Lock()
+	defer c.mux.Unlock()
+	c.reduceTasks[reduceTaskID].finished = 2
 	return nil
 }
 
@@ -63,6 +100,7 @@ func (c *Coordinator) FinishReduceTask(reduceTaskID int, reply *struct{}) error 
 // the RPC argument and reply types are defined in rpc.go.
 func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 	reply.Y = args.X + 1
+	fmt.Println("rpc example")
 	return nil
 }
 
@@ -83,23 +121,25 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	ret := false
 
 	// Your code here.
+	c.mux.Lock()
+	defer c.mux.Unlock()
+
 	for _, task := range c.mapTasks {
-		if !task.finished {
+		if task.finished != 2 {
 			return false
 		}
 	}
 
 	for _, task := range c.reduceTasks {
-		if !task.finished {
+		if task.finished != 2 {
 			return false
 		}
 	}
 
-	ret = true
-	return ret
+	fmt.Println("all finished")
+	return true
 }
 
 // create a Coordinator.
@@ -111,10 +151,11 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	// Your code here.
 	c.nReduce = nReduce
 	for i, filename := range files {
-		c.mapTasks = append(c.mapTasks, task{filename, false, i})
+		c.mapTasks = append(c.mapTasks, task{filename, 0, i})
 	}
 	for i := 0; i < nReduce; i++ {
-		c.reduceTasks = append(c.reduceTasks, task{"", false, i})
+		filename := fmt.Sprintf("mr-inter-%v", i)
+		c.reduceTasks = append(c.reduceTasks, task{filename, 0, i})
 	}
 
 	c.server()
