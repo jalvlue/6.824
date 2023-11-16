@@ -40,6 +40,10 @@ type HeartBeatArgs struct {
 	TaskID int
 }
 
+type NoticeFinishMapReply struct {
+	CanReduce bool
+}
+
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
 // Can't use the current directory since

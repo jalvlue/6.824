@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 )
 
 // for sorting by key.
@@ -33,10 +34,8 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-var (
-	heartBeatChan = make(chan struct{})
-	DoneChan      = make(chan struct{})
-)
+var DoneChan = make(chan struct{})
+var canReduce = false
 
 // main/mrworker.go calls this function.
 func Worker(
@@ -44,10 +43,11 @@ func Worker(
 	reducef func(string, []string) string,
 ) {
 	// uncomment to send the Example RPC to the coordinator.
-	CallExample()
+	// CallExample()
 
 	// Your worker implementation here.
-	for {
+	// do map task
+	for !canReduce {
 		reply, ok := askToMap()
 		if !ok {
 			fmt.Println("cannot contact the coordinator")
@@ -58,36 +58,51 @@ func Worker(
 		nReduce := reply.NReduce
 		mapTaskID := reply.TaskID
 
-		// failed to ask for map task
-		// try to ask for reduce task
-		if filename == "" {
-			var reduceTaskID int
-			reduceTaskID, ok = askToReduce()
-			if !ok {
-				fmt.Println("cannot contact the coordinator")
-				return
-			}
+		go doHeartBeat(mapTaskID)
+		doMapTask(filename, nReduce, mapTaskID, mapf)
+		DoneChan <- struct{}{}
+		canReduce = noticeFinishMap(mapTaskID)
+	}
 
-			if reduceTaskID == -1 {
-				fmt.Println("No reduce tasks to do")
-				break
-			} else {
-				// do reduce task
-				go doHeartBeat(reduceTaskID)
-				doReduceTask(reduceTaskID, reducef)
-				DoneChan <- struct{}{}
-			}
+	for {
+		reduceTaskID, ok := askToReduce()
+		if !ok {
+			fmt.Println("cannot contact the coordinator")
+			return
+		}
+
+		if reduceTaskID == -1 {
+			fmt.Println("All tasks finished!")
+			return
 		} else {
-			// do map task
-			go doHeartBeat(mapTaskID)
-			doMapTask(filename, nReduce, mapTaskID, mapf)
+			// do reduce task
+			go doHeartBeat(reduceTaskID)
+			doReduceTask(reduceTaskID, reducef)
 			DoneChan <- struct{}{}
+			noticeFinishReduce(reduceTaskID)
 		}
 	}
 
 }
 
 func doHeartBeat(taskID int) {
+	args := HeartBeatArgs{}
+	args.TaskID = taskID
+
+	for {
+		select {
+		case <-DoneChan:
+			return
+		default:
+			ok := call("Coordinator.HeartBeat", &args, &struct{}{})
+			if ok {
+				fmt.Printf("HeartBeat %v\n", taskID)
+				time.Sleep(time.Second)
+			} else {
+				fmt.Printf("Can not contact coordinator, HeartBeat failed!\n")
+			}
+		}
+	}
 }
 
 func askToMap() (Reply, bool) {
@@ -106,15 +121,17 @@ func askToMap() (Reply, bool) {
 	return reply, ok
 }
 
-func noticeFinishMap(mapTaskID int) {
-	reply := struct{}{}
+func noticeFinishMap(mapTaskID int) bool {
+	reply := NoticeFinishMapReply{}
 
 	ok := call("Coordinator.FinishMapTask", mapTaskID, &reply)
 	if ok {
-		fmt.Printf("reply.FileName %v\n", reply)
+		fmt.Printf("finished map task: %v\n", mapTaskID)
 	} else {
 		fmt.Printf("call failed!\n")
 	}
+
+	return reply.CanReduce
 }
 
 func askToReduce() (int, bool) {
@@ -135,7 +152,7 @@ func noticeFinishReduce(reduceTaskID int) {
 
 	ok := call("Coordinator.FinishReduceTask", reduceTaskID, &reply)
 	if ok {
-		fmt.Printf("reply.FileName %v\n", reply)
+		fmt.Printf("finished reduce task: %v\n", reduceTaskID)
 	} else {
 		fmt.Printf("call failed!\n")
 	}
@@ -187,8 +204,6 @@ func doMapTask(filename string, nReduce int, mapTaskID int, mapf func(string, st
 			log.Fatal(err)
 		}
 	}
-
-	noticeFinishMap(mapTaskID)
 }
 
 func collectTempFilesWithSuffix(suffix string) ([]string, error) {
@@ -257,8 +272,6 @@ func doReduceTask(reduceTaskID int, reducef func(string, []string) string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	noticeFinishReduce(reduceTaskID)
 }
 
 // example function to show how to make an RPC call to the coordinator.
