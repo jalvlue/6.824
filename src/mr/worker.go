@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"path/filepath"
 	"sort"
 )
 
@@ -31,6 +32,11 @@ func ihash(key string) int {
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
+
+var (
+	heartBeatChan = make(chan struct{})
+	DoneChan      = make(chan struct{})
+)
 
 // main/mrworker.go calls this function.
 func Worker(
@@ -56,25 +62,32 @@ func Worker(
 		// try to ask for reduce task
 		if filename == "" {
 			var reduceTaskID int
-			filename, reduceTaskID, ok = askToReduce()
+			reduceTaskID, ok = askToReduce()
 			if !ok {
 				fmt.Println("cannot contact the coordinator")
 				return
 			}
 
-			if filename == "" {
+			if reduceTaskID == -1 {
 				fmt.Println("No reduce tasks to do")
 				break
 			} else {
 				// do reduce task
-				doReduceTask(filename, reduceTaskID, reducef)
+				go doHeartBeat(reduceTaskID)
+				doReduceTask(reduceTaskID, reducef)
+				DoneChan <- struct{}{}
 			}
 		} else {
 			// do map task
+			go doHeartBeat(mapTaskID)
 			doMapTask(filename, nReduce, mapTaskID, mapf)
+			DoneChan <- struct{}{}
 		}
 	}
 
+}
+
+func doHeartBeat(taskID int) {
 }
 
 func askToMap() (Reply, bool) {
@@ -104,7 +117,7 @@ func noticeFinishMap(mapTaskID int) {
 	}
 }
 
-func askToReduce() (string, int, bool) {
+func askToReduce() (int, bool) {
 	reply := Reply{}
 
 	ok := call("Coordinator.AssignReduceTask", struct{}{}, &reply)
@@ -114,7 +127,7 @@ func askToReduce() (string, int, bool) {
 		fmt.Printf("call failed!\n")
 	}
 
-	return reply.FileName, reply.TaskID, ok
+	return reply.TaskID, ok
 }
 
 func noticeFinishReduce(reduceTaskID int) {
@@ -149,42 +162,73 @@ func doMapTask(filename string, nReduce int, mapTaskID int, mapf func(string, st
 
 	// write intermediate kvs to file
 	for i, inter := range intermediate {
-		oname := fmt.Sprintf("mr-inter-%v", i)
-		ofile, err := os.OpenFile(oname, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		oname := fmt.Sprintf("mr-%v-%v.tmp", mapTaskID, i)
+		tempFile, err := os.CreateTemp("", oname)
 		if err != nil {
 			log.Fatal(err)
 		}
-		enc := json.NewEncoder(ofile)
+		defer os.Remove(tempFile.Name())
+
+		enc := json.NewEncoder(tempFile)
 		for _, kv := range inter {
 			err := enc.Encode(&kv)
 			if err != nil {
 				log.Fatal(err)
 			}
 		}
-		ofile.Close()
+		err = tempFile.Close()
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		newName := fmt.Sprintf("mr-inter-%v-%v", mapTaskID, i)
+		err = os.Rename(tempFile.Name(), newName)
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 
 	noticeFinishMap(mapTaskID)
 }
 
-func doReduceTask(filename string, reduceTaskID int, reducef func(string, []string) string) {
-	ofile, err := os.Open(filename)
+func collectTempFilesWithSuffix(suffix string) ([]string, error) {
+	pattern := "*" + suffix
+	files, err := filepath.Glob(pattern)
 	if err != nil {
-		log.Fatalf("cannot open %v", filename)
+		log.Fatal(err)
 	}
-	dec := json.NewDecoder(ofile)
+	return files, err
+}
+
+func doReduceTask(reduceTaskID int, reducef func(string, []string) string) {
+	tmpFiles, err := collectTempFilesWithSuffix(fmt.Sprint(reduceTaskID))
+	if err != nil {
+		log.Fatal(err)
+	}
 	kva := []KeyValue{}
-	for {
-		var kv KeyValue
-		if err := dec.Decode(&kv); err != nil {
-			break
+	for _, filename := range tmpFiles {
+		ofile, err := os.Open(filename)
+		if err != nil {
+			log.Fatalf("cannot open %v", filename)
 		}
-		kva = append(kva, kv)
+		dec := json.NewDecoder(ofile)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			kva = append(kva, kv)
+		}
+		ofile.Close()
 	}
 
 	sort.Sort(ByKey(kva))
-	oname := fmt.Sprintf("mr-out-%v", reduceTaskID)
-	ofile, _ = os.Create(oname)
+	oname := fmt.Sprintf("mr-out-%v.tmp", reduceTaskID)
+	tempFile, err := os.CreateTemp("", oname)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer os.Remove(tempFile.Name())
 
 	i := 0
 	for i < len(kva) {
@@ -198,12 +242,22 @@ func doReduceTask(filename string, reduceTaskID int, reducef func(string, []stri
 		}
 		output := reducef(kva[i].Key, values)
 
-		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+		fmt.Fprintf(tempFile, "%v %v\n", kva[i].Key, output)
 
 		i = j
 	}
 
-	ofile.Close()
+	err = tempFile.Close()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	newName := fmt.Sprintf("mr-out-%v", reduceTaskID)
+	err = os.Rename(tempFile.Name(), newName)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	noticeFinishReduce(reduceTaskID)
 }
 

@@ -83,4 +83,4 @@ fi
 # wait for remaining workers and coordinator to exit.
 wait
 
-rm -f mr-inter-* mr-out-*
+rm -f mr-inter-* mr-out-* mr-wc-all

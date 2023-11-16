@@ -12,11 +12,12 @@ import (
 
 type Coordinator struct {
 	// Your definitions here.
-	mapTasks    []task
-	reduceTasks []task
-	nReduce     int
-	canReduce   bool
-	mux         sync.Mutex
+	mapTasks     []task
+	reduceTasks  []task
+	nReduce      int
+	canReduce    bool
+	mux          sync.Mutex
+	onGoingTasks []int
 }
 
 // finished: 0: not finished, 1: on going, 2: finished
@@ -39,6 +40,7 @@ func (c *Coordinator) AssignMapTask(args *Args, reply *Reply) error {
 			fmt.Println("assigned task:", task.fileName)
 
 			c.mapTasks[i].finished = 1
+			c.onGoingTasks = append(c.onGoingTasks, task.taskID)
 			return nil
 		}
 	}
@@ -65,18 +67,29 @@ func (c *Coordinator) AssignReduceTask(args *Args, rReply *Reply) error {
 			fmt.Println("assigned task:", task.fileName)
 
 			c.reduceTasks[i].finished = 1
+			c.onGoingTasks = append(c.onGoingTasks, task.taskID)
 			return nil
 		}
 	}
-	rReply.FileName = ""
+	rReply.TaskID = -1
 	fmt.Println("all reduce tasks finished")
 	return nil
+}
+
+func removeElement(slice []int, elem int) []int {
+	for i, e := range slice {
+		if e == elem {
+			return append(slice[:i], slice[i+1:]...)
+		}
+	}
+	return slice
 }
 
 func (c *Coordinator) FinishMapTask(mapTaskID int, reply *struct{}) error {
 	c.mux.Lock()
 	defer c.mux.Unlock()
 	c.mapTasks[mapTaskID].finished = 2
+	removeElement(c.onGoingTasks, mapTaskID)
 
 	for _, task := range c.mapTasks {
 		if task.finished != 2 {
@@ -92,6 +105,7 @@ func (c *Coordinator) FinishReduceTask(reduceTaskID int, reply *struct{}) error 
 	c.mux.Lock()
 	defer c.mux.Unlock()
 	c.reduceTasks[reduceTaskID].finished = 2
+	removeElement(c.onGoingTasks, reduceTaskID)
 	return nil
 }
 
