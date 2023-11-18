@@ -36,6 +36,7 @@ func ihash(key string) int {
 
 var DoneChan = make(chan struct{})
 var canReduce = false
+var isDuplicated bool
 
 // main/mrworker.go calls this function.
 func Worker(
@@ -54,40 +55,76 @@ func Worker(
 			return
 		}
 
-		filename := reply.FileName
-		nReduce := reply.NReduce
 		mapTaskID := reply.TaskID
+		if mapTaskID == -1 {
+			fmt.Println("no map task to do! wait for other map tasks to finish")
+			time.Sleep(time.Second)
+		} else if mapTaskID == -2 {
+			fmt.Println("All tasks finished!")
+			canReduce = true
+			continue
+		} else {
+			nReduce := reply.NReduce
+			filename := reply.FileName
+			attempt := reply.Attempt
 
-		go doHeartBeat(mapTaskID)
-		doMapTask(filename, nReduce, mapTaskID, mapf)
-		DoneChan <- struct{}{}
-		canReduce = noticeFinishMap(mapTaskID)
+			go doHeartBeat(mapTaskID, attempt)
+			doMapTask(filename, nReduce, mapTaskID, attempt, mapf)
+			DoneChan <- struct{}{}
+			finishMapArgs := NoticeFinishTaskArgs{
+				TaskID:  mapTaskID,
+				Attempt: attempt,
+			}
+			canReduce, isDuplicated = noticeFinishMap(finishMapArgs)
+			if isDuplicated {
+				fmt.Println("map task duplicated!")
+				for i := 0; i < nReduce; i++ {
+					interName := fmt.Sprintf("mr-inter-%v-%v-%v", mapTaskID, attempt, i)
+					os.Remove(interName)
+				}
+			} else {
+				fmt.Println("finish map task:", mapTaskID)
+			}
+		}
 	}
 
 	for {
-		reduceTaskID, ok := askToReduce()
+		reply, ok := askToReduce()
 		if !ok {
 			fmt.Println("cannot contact the coordinator")
 			return
 		}
 
+		reduceTaskID := reply.TaskID
 		if reduceTaskID == -1 {
+			fmt.Println("no reduce task to do! wait for other reduce tasks to finish")
+			time.Sleep(time.Second)
+		} else if reduceTaskID == -2 {
 			fmt.Println("All tasks finished!")
 			return
 		} else {
 			// do reduce task
-			go doHeartBeat(reduceTaskID)
-			doReduceTask(reduceTaskID, reducef)
+			attempt := reply.Attempt
+
+			go doHeartBeat(reduceTaskID, attempt)
+			ofile := doReduceTask(reduceTaskID, attempt, reducef)
 			DoneChan <- struct{}{}
-			noticeFinishReduce(reduceTaskID)
+			finishReduceArgs := NoticeFinishTaskArgs{
+				TaskID:  reduceTaskID,
+				Attempt: attempt,
+			}
+			isDuplicated := noticeFinishReduce(finishReduceArgs)
+			if isDuplicated {
+				os.Remove(ofile)
+			}
 		}
 	}
-
 }
 
-func doHeartBeat(taskID int) {
+func doHeartBeat(taskID int, attempt int) {
 	args := HeartBeatArgs{}
 	args.TaskID = taskID
+	args.Attempt = attempt
 
 	for {
 		select {
@@ -96,7 +133,7 @@ func doHeartBeat(taskID int) {
 		default:
 			ok := call("Coordinator.HeartBeat", &args, &struct{}{})
 			if ok {
-				fmt.Printf("HeartBeat %v\n", taskID)
+				fmt.Printf("HeartBeat task: %v attempt: %v\n", taskID, attempt)
 				time.Sleep(time.Second)
 			} else {
 				fmt.Printf("Can not contact coordinator, HeartBeat failed!\n")
@@ -121,44 +158,46 @@ func askToMap() (Reply, bool) {
 	return reply, ok
 }
 
-func noticeFinishMap(mapTaskID int) bool {
-	reply := NoticeFinishMapReply{}
+func noticeFinishMap(args NoticeFinishTaskArgs) (bool, bool) {
+	reply := NoticeFinishTaskReply{}
 
-	ok := call("Coordinator.FinishMapTask", mapTaskID, &reply)
-	if ok {
-		fmt.Printf("finished map task: %v\n", mapTaskID)
-	} else {
+	ok := call("Coordinator.FinishMapTask", &args, &reply)
+	if !ok {
 		fmt.Printf("call failed!\n")
 	}
 
-	return reply.CanReduce
+	return reply.CanReduce, reply.IsDuplicate
 }
 
-func askToReduce() (int, bool) {
+func askToReduce() (Reply, bool) {
+	Args := Args{}
+	Args.TaskType = "reduce"
 	reply := Reply{}
 
-	ok := call("Coordinator.AssignReduceTask", struct{}{}, &reply)
+	ok := call("Coordinator.AssignReduceTask", &Args, &reply)
 	if ok {
 		fmt.Printf("reply.FileName %v\n", reply.FileName)
 	} else {
 		fmt.Printf("call failed!\n")
 	}
 
-	return reply.TaskID, ok
+	return reply, ok
 }
 
-func noticeFinishReduce(reduceTaskID int) {
-	reply := struct{}{}
+func noticeFinishReduce(args NoticeFinishTaskArgs) bool {
+	reply := NoticeFinishTaskReply{}
 
-	ok := call("Coordinator.FinishReduceTask", reduceTaskID, &reply)
+	ok := call("Coordinator.FinishReduceTask", &args, &reply)
 	if ok {
-		fmt.Printf("finished reduce task: %v\n", reduceTaskID)
+		fmt.Printf("finished reduce task: %v\n", args.TaskID)
 	} else {
 		fmt.Printf("call failed!\n")
 	}
+
+	return reply.IsDuplicate
 }
 
-func doMapTask(filename string, nReduce int, mapTaskID int, mapf func(string, string) []KeyValue) {
+func doMapTask(filename string, nReduce, mapTaskID, attempt int, mapf func(string, string) []KeyValue) {
 
 	// read kvs from file
 	file, err := os.Open(filename)
@@ -172,6 +211,7 @@ func doMapTask(filename string, nReduce int, mapTaskID int, mapf func(string, st
 	file.Close()
 	kva := mapf(filename, string(content))
 	intermediate := [10][]KeyValue{}
+	//intermediate := make([][]KeyValue, nReduce)
 	for _, kv := range kva {
 		rNum := ihash(kv.Key) % nReduce
 		intermediate[rNum] = append(intermediate[rNum], kv)
@@ -179,7 +219,7 @@ func doMapTask(filename string, nReduce int, mapTaskID int, mapf func(string, st
 
 	// write intermediate kvs to file
 	for i, inter := range intermediate {
-		oname := fmt.Sprintf("mr-%v-%v.tmp", mapTaskID, i)
+		oname := fmt.Sprintf("mr-%v-%v-%v.tmp", mapTaskID, attempt, i)
 		tempFile, err := os.CreateTemp("", oname)
 		if err != nil {
 			log.Fatal(err)
@@ -198,7 +238,7 @@ func doMapTask(filename string, nReduce int, mapTaskID int, mapf func(string, st
 			log.Fatal(err)
 		}
 
-		newName := fmt.Sprintf("mr-inter-%v-%v", mapTaskID, i)
+		newName := fmt.Sprintf("mr-inter-%v-%v-%v", mapTaskID, attempt, i)
 		err = os.Rename(tempFile.Name(), newName)
 		if err != nil {
 			log.Fatal(err)
@@ -215,7 +255,7 @@ func collectTempFilesWithSuffix(suffix string) ([]string, error) {
 	return files, err
 }
 
-func doReduceTask(reduceTaskID int, reducef func(string, []string) string) {
+func doReduceTask(reduceTaskID, attempt int, reducef func(string, []string) string) string {
 	tmpFiles, err := collectTempFilesWithSuffix(fmt.Sprint(reduceTaskID))
 	if err != nil {
 		log.Fatal(err)
@@ -238,7 +278,7 @@ func doReduceTask(reduceTaskID int, reducef func(string, []string) string) {
 	}
 
 	sort.Sort(ByKey(kva))
-	oname := fmt.Sprintf("mr-out-%v.tmp", reduceTaskID)
+	oname := fmt.Sprintf("mr-out-%v-%v.tmp", reduceTaskID, attempt)
 	tempFile, err := os.CreateTemp("", oname)
 	if err != nil {
 		log.Fatal(err)
@@ -267,11 +307,13 @@ func doReduceTask(reduceTaskID int, reducef func(string, []string) string) {
 		log.Fatal(err)
 	}
 
-	newName := fmt.Sprintf("mr-out-%v", reduceTaskID)
+	newName := fmt.Sprintf("mr-out-%v-%v", reduceTaskID, attempt)
 	err = os.Rename(tempFile.Name(), newName)
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	return newName
 }
 
 // example function to show how to make an RPC call to the coordinator.

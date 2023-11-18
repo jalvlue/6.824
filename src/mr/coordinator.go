@@ -26,70 +26,102 @@ type task struct {
 	finished      byte
 	taskID        int
 	lastHeartBeat int
+	assignAttmept int
 }
 
 func (c *Coordinator) HeartBeat(args *HeartBeatArgs, reply *struct{}) error {
-	fmt.Println("heartbeat from task:", args.TaskID)
 	c.mux.Lock()
 	defer c.mux.Unlock()
 
+	isDuplicated := true
 	if !c.canReduce {
 		// map phase
-		c.mapTasks[args.TaskID].lastHeartBeat = 0
+		if c.mapTasks[args.TaskID].assignAttmept == args.Attempt {
+			c.mapTasks[args.TaskID].lastHeartBeat = 0
+			isDuplicated = false
+		}
 	} else {
 		// reduce phase
-		c.reduceTasks[args.TaskID].lastHeartBeat = 0
+		if c.reduceTasks[args.TaskID].assignAttmept == args.Attempt {
+			c.reduceTasks[args.TaskID].lastHeartBeat = 0
+			isDuplicated = false
+		}
+	}
+	if isDuplicated {
+		fmt.Println("coordinator>: duplicated heartbeat")
+		fmt.Printf("coordinator>: AssignAttmept: %v, Attempt: %v\n", c.mapTasks[args.TaskID].assignAttmept, args.Attempt)
+	} else {
+		fmt.Printf("coordinator>: heartbeat from task: %v, attempt: %v\n", args.TaskID, args.Attempt)
 	}
 
 	return nil
 }
 
 func (c *Coordinator) AssignMapTask(args *Args, reply *Reply) error {
-	fmt.Println("try AssignMapTask call")
+	fmt.Println("coordinator>: try AssignMapTask call")
+	isOnGoing := false
 	c.mux.Lock()
 	defer c.mux.Unlock()
 	for i, task := range c.mapTasks {
 		if task.finished == 0 {
+			c.mapTasks[i].finished = 1
+			c.mapTasks[i].assignAttmept++
+			c.onGoingTasks = append(c.onGoingTasks, task.taskID)
+
 			reply.FileName = task.fileName
 			reply.NReduce = c.nReduce
-			reply.TaskType = args.TaskType
 			reply.TaskID = task.taskID
-			fmt.Printf("assigned map task: %v, %s\n", task.taskID, task.fileName)
-
-			c.mapTasks[i].finished = 1
-			c.onGoingTasks = append(c.onGoingTasks, task.taskID)
+			reply.Attempt = c.mapTasks[i].assignAttmept
+			fmt.Printf("coordinator>: assigned map task: %v, %s\n", task.taskID, task.fileName)
+			fmt.Printf("coordinator>: AssignAttmept: %v, Attempt: %v\n", c.mapTasks[i].assignAttmept, task.assignAttmept)
 			return nil
+		} else if task.finished == 1 {
+			isOnGoing = true
 		}
 	}
-	reply.FileName = ""
-	fmt.Println("all map tasks finished")
+	if isOnGoing {
+		reply.TaskID = -1
+		fmt.Println("coordinator>: on going map tasks")
+		return nil
+	}
+	reply.TaskID = -2
+	fmt.Println("coordinator>: all map tasks finished, you can reduce attempt")
 	return nil
 }
 
 func (c *Coordinator) AssignReduceTask(args *Args, rReply *Reply) error {
-	fmt.Println("try AssignReduceTask call")
+	fmt.Println("coordinator>: try AssignReduceTask call")
+	isOnGoing := false
 	c.mux.Lock()
 	defer c.mux.Unlock()
 	if !c.canReduce {
 		rReply.FileName = ""
-		fmt.Println("not ready to reduce")
+		fmt.Println("coordinator>: not ready to reduce")
 		return nil
 	}
 
 	for i, task := range c.reduceTasks {
 		if task.finished == 0 {
-			rReply.FileName = task.fileName
-			rReply.TaskType = args.TaskType
-			rReply.TaskID = task.taskID
-			fmt.Printf("assigned reduce task: %v, %s\n", task.taskID, task.fileName)
-
 			c.reduceTasks[i].finished = 1
+			c.reduceTasks[i].assignAttmept++
 			c.onGoingTasks = append(c.onGoingTasks, task.taskID)
+
+			rReply.FileName = task.fileName
+			rReply.TaskID = task.taskID
+			rReply.Attempt = c.reduceTasks[i].assignAttmept
+			fmt.Printf("coordinator>: assigned reduce task: %v, %s\n", task.taskID, task.fileName)
 			return nil
+		} else if task.finished == 1 {
+			isOnGoing = true
 		}
 	}
-	rReply.TaskID = -1
-	fmt.Println("all reduce tasks finished")
+	if isOnGoing {
+		rReply.TaskID = -1
+		fmt.Println("coordinator>: on going reduce tasks")
+		return nil
+	}
+	rReply.TaskID = -2
+	fmt.Println("coordinator>: all reduce tasks finished")
 	return nil
 }
 
@@ -102,13 +134,24 @@ func removeElement(slice []int, elem int) []int {
 	return slice
 }
 
-func (c *Coordinator) FinishMapTask(mapTaskID int, reply *NoticeFinishMapReply) error {
+func (c *Coordinator) FinishMapTask(args *NoticeFinishTaskArgs, reply *NoticeFinishTaskReply) error {
 	c.mux.Lock()
 	defer c.mux.Unlock()
-	c.mapTasks[mapTaskID].finished = 2
-	c.onGoingTasks = removeElement(c.onGoingTasks, mapTaskID)
-	fmt.Println("finished map task:", mapTaskID)
 
+	taskID := args.TaskID
+	// TODO: check whether the timeout task have been reassigned to other worker
+	if c.mapTasks[taskID].assignAttmept != args.Attempt {
+		fmt.Println("coordinator>: duplicated attempt")
+		reply.IsDuplicate = true
+		reply.CanReduce = false
+		return nil
+	} else {
+		c.onGoingTasks = removeElement(c.onGoingTasks, taskID)
+	}
+	c.mapTasks[taskID].finished = 2
+	fmt.Println("coordinator>: finished map task:", taskID)
+
+	reply.IsDuplicate = false
 	for _, task := range c.mapTasks {
 		if task.finished != 2 {
 			reply.CanReduce = false
@@ -121,12 +164,21 @@ func (c *Coordinator) FinishMapTask(mapTaskID int, reply *NoticeFinishMapReply) 
 	return nil
 }
 
-func (c *Coordinator) FinishReduceTask(reduceTaskID int, reply *struct{}) error {
+func (c *Coordinator) FinishReduceTask(args *NoticeFinishTaskArgs, reply *NoticeFinishTaskReply) error {
 	c.mux.Lock()
 	defer c.mux.Unlock()
+
+	reduceTaskID := args.TaskID
+	if c.reduceTasks[reduceTaskID].assignAttmept != args.Attempt {
+		fmt.Println("coordinator>: duplicated attempt")
+		reply.IsDuplicate = true
+		return nil
+	} else {
+		c.onGoingTasks = removeElement(c.onGoingTasks, reduceTaskID)
+	}
 	c.reduceTasks[reduceTaskID].finished = 2
-	c.onGoingTasks = removeElement(c.onGoingTasks, reduceTaskID)
-	fmt.Println("finished reduce task:", reduceTaskID)
+	reply.IsDuplicate = false
+	fmt.Println("coordinator>: finished reduce task:", reduceTaskID)
 	return nil
 }
 
@@ -162,28 +214,30 @@ func (c *Coordinator) Done() bool {
 	defer c.mux.Unlock()
 
 	// check heartbeat timeout
-	fmt.Println("onGoingTasks:", c.onGoingTasks)
+	fmt.Println("coordinator>: onGoingTasks:", c.onGoingTasks)
 	timeoutTasks := make([]int, 0)
 	if !c.canReduce {
 		for _, taskID := range c.onGoingTasks {
 			if c.mapTasks[taskID].lastHeartBeat > 10 {
-				fmt.Println("map task:", taskID, "timeout")
+				fmt.Println("coordinator>: map task:", taskID, "timeout")
 				c.mapTasks[taskID].finished = 0
 				c.mapTasks[taskID].lastHeartBeat = 0
 				timeoutTasks = append(timeoutTasks, taskID)
 			} else {
 				c.mapTasks[taskID].lastHeartBeat++
+				fmt.Println("coordinator>: map task:", taskID, "lastHeartBeat:", c.mapTasks[taskID].lastHeartBeat)
 			}
 		}
 	} else {
 		for _, taskID := range c.onGoingTasks {
 			if c.reduceTasks[taskID].lastHeartBeat > 10 {
-				fmt.Println("reduce task:", taskID, "timeout")
+				fmt.Println("coordinator>: reduce task:", taskID, "timeout")
 				c.reduceTasks[taskID].finished = 0
 				c.reduceTasks[taskID].lastHeartBeat = 0
 				timeoutTasks = append(timeoutTasks, taskID)
 			} else {
 				c.reduceTasks[taskID].lastHeartBeat++
+				fmt.Println("coordinator>: reduce task:", taskID, "lastHeartBeat:", c.reduceTasks[taskID].lastHeartBeat)
 			}
 		}
 	}
@@ -203,7 +257,7 @@ func (c *Coordinator) Done() bool {
 		}
 	}
 
-	fmt.Println("all finished")
+	fmt.Println("coordinator>: all finished")
 	return true
 }
 
@@ -222,6 +276,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 			finished:      0,
 			taskID:        i,
 			lastHeartBeat: 0,
+			assignAttmept: 0,
 		})
 	}
 
@@ -232,6 +287,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 			finished:      0,
 			taskID:        i,
 			lastHeartBeat: 0,
+			assignAttmept: 0,
 		})
 	}
 

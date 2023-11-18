@@ -32,16 +32,23 @@ type Args struct {
 type Reply struct {
 	FileName string
 	NReduce  int
-	TaskType string
 	TaskID   int
+	Attempt  int
 }
 
 type HeartBeatArgs struct {
-	TaskID int
+	TaskID  int
+	Attempt int
 }
 
-type NoticeFinishMapReply struct {
-	CanReduce bool
+type NoticeFinishTaskArgs struct {
+	TaskID  int
+	Attempt int
+}
+
+type NoticeFinishTaskReply struct {
+	CanReduce   bool
+	IsDuplicate bool
 }
 
 // Cook up a unique-ish UNIX-domain socket name
