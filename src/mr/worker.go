@@ -51,16 +51,16 @@ func Worker(
 	for !canReduce {
 		reply, ok := askToMap()
 		if !ok {
-			fmt.Println("cannot contact the coordinator")
+			log.Println("cannot contact the coordinator")
 			return
 		}
 
 		mapTaskID := reply.TaskID
 		if mapTaskID == -1 {
-			fmt.Println("no map task to do! wait for other map tasks to finish")
+			log.Println("no map task to do! wait for other map tasks to finish")
 			time.Sleep(time.Second)
 		} else if mapTaskID == -2 {
-			fmt.Println("All tasks finished!")
+			log.Println("All tasks finished!")
 			canReduce = true
 			continue
 		} else {
@@ -77,13 +77,13 @@ func Worker(
 			}
 			canReduce, isDuplicated = noticeFinishMap(finishMapArgs)
 			if isDuplicated {
-				fmt.Println("map task duplicated!")
+				log.Println("map task duplicated!")
 				for i := 0; i < nReduce; i++ {
 					interName := fmt.Sprintf("mr-inter-%v-%v-%v", mapTaskID, attempt, i)
 					os.Remove(interName)
 				}
 			} else {
-				fmt.Println("finish map task:", mapTaskID)
+				log.Println("finish map task:", mapTaskID)
 			}
 		}
 	}
@@ -91,16 +91,16 @@ func Worker(
 	for {
 		reply, ok := askToReduce()
 		if !ok {
-			fmt.Println("cannot contact the coordinator")
+			log.Println("cannot contact the coordinator")
 			return
 		}
 
 		reduceTaskID := reply.TaskID
 		if reduceTaskID == -1 {
-			fmt.Println("no reduce task to do! wait for other reduce tasks to finish")
+			log.Println("no reduce task to do! wait for other reduce tasks to finish")
 			time.Sleep(time.Second)
 		} else if reduceTaskID == -2 {
-			fmt.Println("All tasks finished!")
+			log.Println("All tasks finished!")
 			return
 		} else {
 			// do reduce task
@@ -133,10 +133,10 @@ func doHeartBeat(taskID int, attempt int) {
 		default:
 			ok := call("Coordinator.HeartBeat", &args, &struct{}{})
 			if ok {
-				fmt.Printf("HeartBeat task: %v attempt: %v\n", taskID, attempt)
+				log.Printf("HeartBeat task: %v attempt: %v\n", taskID, attempt)
 				time.Sleep(time.Second)
 			} else {
-				fmt.Printf("Can not contact coordinator, HeartBeat failed!\n")
+				log.Printf("Can not contact coordinator, HeartBeat failed!\n")
 			}
 		}
 	}
@@ -150,9 +150,9 @@ func askToMap() (Reply, bool) {
 	//ok := call("Coordinator.Example", &args, &reply)
 	ok := call("Coordinator.AssignMapTask", &args, &reply)
 	if ok {
-		fmt.Printf("reply.FileName %v\n", reply.FileName)
+		log.Printf("reply.FileName %v\n", reply.FileName)
 	} else {
-		fmt.Printf("call failed!\n")
+		log.Printf("call failed!\n")
 	}
 
 	return reply, ok
@@ -163,7 +163,7 @@ func noticeFinishMap(args NoticeFinishTaskArgs) (bool, bool) {
 
 	ok := call("Coordinator.FinishMapTask", &args, &reply)
 	if !ok {
-		fmt.Printf("call failed!\n")
+		log.Printf("call failed!\n")
 	}
 
 	return reply.CanReduce, reply.IsDuplicate
@@ -176,9 +176,9 @@ func askToReduce() (Reply, bool) {
 
 	ok := call("Coordinator.AssignReduceTask", &Args, &reply)
 	if ok {
-		fmt.Printf("reply.FileName %v\n", reply.FileName)
+		log.Printf("reply.FileName %v\n", reply.FileName)
 	} else {
-		fmt.Printf("call failed!\n")
+		log.Printf("call failed!\n")
 	}
 
 	return reply, ok
@@ -189,9 +189,9 @@ func noticeFinishReduce(args NoticeFinishTaskArgs) bool {
 
 	ok := call("Coordinator.FinishReduceTask", &args, &reply)
 	if ok {
-		fmt.Printf("finished reduce task: %v\n", args.TaskID)
+		log.Printf("finished reduce task: %v\n", args.TaskID)
 	} else {
-		fmt.Printf("call failed!\n")
+		log.Printf("call failed!\n")
 	}
 
 	return reply.IsDuplicate
@@ -337,9 +337,9 @@ func CallExample() {
 	ok := call("Coordinator.Example", &args, &reply)
 	if ok {
 		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
+		log.Printf("reply.Y %v\n", reply.Y)
 	} else {
-		fmt.Printf("call failed!\n")
+		log.Printf("call failed!\n")
 	}
 }
 

@@ -48,17 +48,17 @@ func (c *Coordinator) HeartBeat(args *HeartBeatArgs, reply *struct{}) error {
 		}
 	}
 	if isDuplicated {
-		fmt.Println("coordinator>: duplicated heartbeat")
-		fmt.Printf("coordinator>: AssignAttmept: %v, Attempt: %v\n", c.mapTasks[args.TaskID].assignAttmept, args.Attempt)
+		log.Println("duplicated heartbeat")
+		log.Printf("AssignAttmept: %v, Attempt: %v\n", c.mapTasks[args.TaskID].assignAttmept, args.Attempt)
 	} else {
-		fmt.Printf("coordinator>: heartbeat from task: %v, attempt: %v\n", args.TaskID, args.Attempt)
+		log.Printf("heartbeat from task: %v, attempt: %v\n", args.TaskID, args.Attempt)
 	}
 
 	return nil
 }
 
 func (c *Coordinator) AssignMapTask(args *Args, reply *Reply) error {
-	fmt.Println("coordinator>: try AssignMapTask call")
+	log.Println("try AssignMapTask call")
 	isOnGoing := false
 	c.mux.Lock()
 	defer c.mux.Unlock()
@@ -72,8 +72,8 @@ func (c *Coordinator) AssignMapTask(args *Args, reply *Reply) error {
 			reply.NReduce = c.nReduce
 			reply.TaskID = task.taskID
 			reply.Attempt = c.mapTasks[i].assignAttmept
-			fmt.Printf("coordinator>: assigned map task: %v, %s\n", task.taskID, task.fileName)
-			fmt.Printf("coordinator>: AssignAttmept: %v, Attempt: %v\n", c.mapTasks[i].assignAttmept, task.assignAttmept)
+			log.Printf("assigned map task: %v, %s\n", task.taskID, task.fileName)
+			log.Printf("AssignAttmept: %v, Attempt: %v\n", c.mapTasks[i].assignAttmept, task.assignAttmept)
 			return nil
 		} else if task.finished == 1 {
 			isOnGoing = true
@@ -81,22 +81,22 @@ func (c *Coordinator) AssignMapTask(args *Args, reply *Reply) error {
 	}
 	if isOnGoing {
 		reply.TaskID = -1
-		fmt.Println("coordinator>: on going map tasks")
+		log.Println("on going map tasks")
 		return nil
 	}
 	reply.TaskID = -2
-	fmt.Println("coordinator>: all map tasks finished, you can reduce attempt")
+	log.Println("all map tasks finished, you can reduce attempt")
 	return nil
 }
 
 func (c *Coordinator) AssignReduceTask(args *Args, rReply *Reply) error {
-	fmt.Println("coordinator>: try AssignReduceTask call")
+	log.Println("try AssignReduceTask call")
 	isOnGoing := false
 	c.mux.Lock()
 	defer c.mux.Unlock()
 	if !c.canReduce {
 		rReply.FileName = ""
-		fmt.Println("coordinator>: not ready to reduce")
+		log.Println("not ready to reduce")
 		return nil
 	}
 
@@ -109,7 +109,7 @@ func (c *Coordinator) AssignReduceTask(args *Args, rReply *Reply) error {
 			rReply.FileName = task.fileName
 			rReply.TaskID = task.taskID
 			rReply.Attempt = c.reduceTasks[i].assignAttmept
-			fmt.Printf("coordinator>: assigned reduce task: %v, %s\n", task.taskID, task.fileName)
+			log.Printf("assigned reduce task: %v, %s\n", task.taskID, task.fileName)
 			return nil
 		} else if task.finished == 1 {
 			isOnGoing = true
@@ -117,11 +117,11 @@ func (c *Coordinator) AssignReduceTask(args *Args, rReply *Reply) error {
 	}
 	if isOnGoing {
 		rReply.TaskID = -1
-		fmt.Println("coordinator>: on going reduce tasks")
+		log.Println("on going reduce tasks")
 		return nil
 	}
 	rReply.TaskID = -2
-	fmt.Println("coordinator>: all reduce tasks finished")
+	log.Println("all reduce tasks finished")
 	return nil
 }
 
@@ -139,9 +139,8 @@ func (c *Coordinator) FinishMapTask(args *NoticeFinishTaskArgs, reply *NoticeFin
 	defer c.mux.Unlock()
 
 	taskID := args.TaskID
-	// TODO: check whether the timeout task have been reassigned to other worker
 	if c.mapTasks[taskID].assignAttmept != args.Attempt {
-		fmt.Println("coordinator>: duplicated attempt")
+		log.Println("duplicated attempt")
 		reply.IsDuplicate = true
 		reply.CanReduce = false
 		return nil
@@ -149,7 +148,7 @@ func (c *Coordinator) FinishMapTask(args *NoticeFinishTaskArgs, reply *NoticeFin
 		c.onGoingTasks = removeElement(c.onGoingTasks, taskID)
 	}
 	c.mapTasks[taskID].finished = 2
-	fmt.Println("coordinator>: finished map task:", taskID)
+	log.Println("finished map task:", taskID)
 
 	reply.IsDuplicate = false
 	for _, task := range c.mapTasks {
@@ -170,7 +169,7 @@ func (c *Coordinator) FinishReduceTask(args *NoticeFinishTaskArgs, reply *Notice
 
 	reduceTaskID := args.TaskID
 	if c.reduceTasks[reduceTaskID].assignAttmept != args.Attempt {
-		fmt.Println("coordinator>: duplicated attempt")
+		log.Println("duplicated attempt")
 		reply.IsDuplicate = true
 		return nil
 	} else {
@@ -178,7 +177,7 @@ func (c *Coordinator) FinishReduceTask(args *NoticeFinishTaskArgs, reply *Notice
 	}
 	c.reduceTasks[reduceTaskID].finished = 2
 	reply.IsDuplicate = false
-	fmt.Println("coordinator>: finished reduce task:", reduceTaskID)
+	log.Println("finished reduce task:", reduceTaskID)
 	return nil
 }
 
@@ -187,7 +186,7 @@ func (c *Coordinator) FinishReduceTask(args *NoticeFinishTaskArgs, reply *Notice
 // the RPC argument and reply types are defined in rpc.go.
 func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 	reply.Y = args.X + 1
-	fmt.Println("rpc example")
+	log.Println("rpc example")
 	return nil
 }
 
@@ -214,30 +213,30 @@ func (c *Coordinator) Done() bool {
 	defer c.mux.Unlock()
 
 	// check heartbeat timeout
-	fmt.Println("coordinator>: onGoingTasks:", c.onGoingTasks)
+	log.Println("onGoingTasks:", c.onGoingTasks)
 	timeoutTasks := make([]int, 0)
 	if !c.canReduce {
 		for _, taskID := range c.onGoingTasks {
 			if c.mapTasks[taskID].lastHeartBeat > 10 {
-				fmt.Println("coordinator>: map task:", taskID, "timeout")
+				log.Println("map task:", taskID, "timeout")
 				c.mapTasks[taskID].finished = 0
 				c.mapTasks[taskID].lastHeartBeat = 0
 				timeoutTasks = append(timeoutTasks, taskID)
 			} else {
 				c.mapTasks[taskID].lastHeartBeat++
-				fmt.Println("coordinator>: map task:", taskID, "lastHeartBeat:", c.mapTasks[taskID].lastHeartBeat)
+				log.Println("map task:", taskID, "lastHeartBeat:", c.mapTasks[taskID].lastHeartBeat)
 			}
 		}
 	} else {
 		for _, taskID := range c.onGoingTasks {
 			if c.reduceTasks[taskID].lastHeartBeat > 10 {
-				fmt.Println("coordinator>: reduce task:", taskID, "timeout")
+				log.Println("reduce task:", taskID, "timeout")
 				c.reduceTasks[taskID].finished = 0
 				c.reduceTasks[taskID].lastHeartBeat = 0
 				timeoutTasks = append(timeoutTasks, taskID)
 			} else {
 				c.reduceTasks[taskID].lastHeartBeat++
-				fmt.Println("coordinator>: reduce task:", taskID, "lastHeartBeat:", c.reduceTasks[taskID].lastHeartBeat)
+				log.Println("reduce task:", taskID, "lastHeartBeat:", c.reduceTasks[taskID].lastHeartBeat)
 			}
 		}
 	}
@@ -257,7 +256,7 @@ func (c *Coordinator) Done() bool {
 		}
 	}
 
-	fmt.Println("coordinator>: all finished")
+	log.Println("all task finished!")
 	return true
 }
 
@@ -265,6 +264,7 @@ func (c *Coordinator) Done() bool {
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
+	log.Println("start coordinator")
 	c := Coordinator{}
 
 	// Your code here.

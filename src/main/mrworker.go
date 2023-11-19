@@ -19,6 +19,17 @@ import (
 	"6.5840/mr"
 )
 
+func init() {
+	filename, err := os.OpenFile("mrworker.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		log.Fatalln("cannot open log file")
+	}
+
+	log.SetOutput(filename)
+	log.SetPrefix("mrworker>: ")
+	log.SetFlags(log.Lshortfile)
+}
+
 func main() {
 	if len(os.Args) != 2 {
 		fmt.Fprintf(os.Stderr, "Usage: mrworker xxx.so\n")
