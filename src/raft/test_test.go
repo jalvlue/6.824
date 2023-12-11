@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
-	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -55,14 +54,6 @@ func TestInitialElection2A(t *testing.T) {
 }
 
 func TestReElection2A(t *testing.T) {
-
-	logFile, err := os.OpenFile("log", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
-	if err != nil {
-		log.Fatalf("error opening file: %v", err)
-	}
-	log.SetOutput(logFile)
-	log.Printf("\n\nTest (2A-3): election after network failure")
-
 	servers := 3
 	cfg := make_config(t, servers, false, false)
 	defer cfg.cleanup()
@@ -74,22 +65,22 @@ func TestReElection2A(t *testing.T) {
 	// if the leader disconnects, a new one should be elected.
 	cfg.disconnect(leader1)
 
-	log.Printf("Test (2A): disconnected leader %v\n", leader1)
+	log.Printf("Test (2A): disconnected leader [%v]\n", leader1)
 	cfg.checkOneLeader()
 
 	// if the old leader rejoins, that shouldn't
 	// disturb the new leader. and the old leader
 	// should switch to follower.
 	cfg.connect(leader1)
-	log.Printf("Test (2A): reconnected leader %v\n", leader1)
+	log.Printf("Test (2A): reconnected leader [%v]\n", leader1)
 	leader2 := cfg.checkOneLeader()
 
 	// if there's no quorum, no new leader should
 	// be elected.
 	cfg.disconnect(leader2)
-	log.Printf("Test (2A): disconnected leader %v\n", leader2)
+	log.Printf("Test (2A): disconnected leader [%v]\n", leader2)
 	cfg.disconnect((leader2 + 1) % servers)
-	log.Printf("Test (2A): disconnected server %v\n", (leader2+1)%servers)
+	log.Printf("Test (2A): disconnected server [%v]\n", (leader2+1)%servers)
 	time.Sleep(2 * RaftElectionTimeout)
 
 	// check that the one connected server
@@ -98,28 +89,18 @@ func TestReElection2A(t *testing.T) {
 
 	// if a quorum arises, it should elect a leader.
 	cfg.connect((leader2 + 1) % servers)
-	log.Printf("Test (2A): reconnected server %v\n", (leader2+1)%servers)
+	log.Printf("Test (2A): reconnected server [%v]\n", (leader2+1)%servers)
 	cfg.checkOneLeader()
 
 	// re-join of last node shouldn't prevent leader from existing.
 	cfg.connect(leader2)
-	log.Printf("Test (2A): reconnected leader %v\n", leader2)
+	log.Printf("Test (2A): reconnected leader [%v]\n", leader2)
 	cfg.checkOneLeader()
 
 	cfg.end()
 }
 
 func TestManyElections2A(t *testing.T) {
-	// TODO: still have some bugs
-
-	logFile, err := os.OpenFile("log", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
-	if err != nil {
-		log.Fatalf("error opening file: %v", err)
-	}
-	log.SetOutput(logFile)
-
-	log.Printf("\n\nTest (2A-3): many elections")
-
 	servers := 7
 	cfg := make_config(t, servers, false, false)
 	defer cfg.cleanup()
@@ -137,7 +118,7 @@ func TestManyElections2A(t *testing.T) {
 		cfg.disconnect(i1)
 		cfg.disconnect(i2)
 		cfg.disconnect(i3)
-		log.Printf("Test (2A): disconnected servers: %v %v %v\n", i1, i2, i3)
+		log.Printf("Test (2A): disconnected servers: [%v] [%v] [%v]\n", i1, i2, i3)
 
 		// either the current leader should still be alive,
 		// or the remaining four should elect a new one.
@@ -146,7 +127,7 @@ func TestManyElections2A(t *testing.T) {
 		cfg.connect(i1)
 		cfg.connect(i2)
 		cfg.connect(i3)
-		log.Printf("Test (2A): reconnected servers: %v %v %v\n", i1, i2, i3)
+		log.Printf("Test (2A): reconnected servers: [%v] [%v] [%v]\n", i1, i2, i3)
 	}
 
 	cfg.checkOneLeader()
