@@ -336,7 +336,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// heartbeat with log entries
-	// TODO: commit index
 	if len(args.Entries) != 0 {
 		// not entries yet, just simply append leader's log
 		if len(rf.log) == 0 {
@@ -352,20 +351,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.applyChan <- ApplyMsg{
 					CommandValid: true,
 					CommandIndex: rf.commitIndex,
-					Command:      rf.log[rf.commitIndex].Command,
+					Command:      rf.log[rf.commitIndex-1].Command,
 				}
 			}
 		} else {
 			// have some entries before
-			for index, entry := range rf.log {
+			for i, entry := range rf.log {
 				// look for the first match entry
+				index := i + 1
 				if index == args.PrevLogIndex && entry.Term == args.PrevLogTerm {
 					// discard mismatched logs
-					rf.log = rf.log[:index+1]
+					rf.log = rf.log[:index]
 					// append leader's log
 					rf.log = append(rf.log, args.Entries...)
-					i, term := rf.lastLogInfo()
-					rf.DPritf(dLog, "matchTerm: %d, matchIndex: %d, lastLogTerm: %d, lastLogIndex: %d", index, entry.Term, term, i)
+					followerLastIndex, followerLastTerm := rf.lastLogInfo()
+					rf.DPritf(dLog, "matchTerm: %d, matchIndex: %d, lastLogTerm: %d, lastLogIndex: %d", entry.Term, index, followerLastTerm, followerLastIndex)
 					// set success and commitIndex
 					reply.Sussess = true
 					if args.LeaderCommit > rf.commitIndex {
@@ -374,7 +374,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 						rf.applyChan <- ApplyMsg{
 							CommandValid: true,
 							CommandIndex: rf.commitIndex,
-							Command:      rf.log[rf.commitIndex].Command,
+							Command:      rf.log[rf.commitIndex-1].Command,
 						}
 					}
 				}
@@ -387,7 +387,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.applyChan <- ApplyMsg{
 				CommandValid: true,
 				CommandIndex: rf.commitIndex,
-				Command:      rf.log[rf.commitIndex].Command,
+				Command:      rf.log[rf.commitIndex-1].Command,
 			}
 		}
 	}
@@ -414,7 +414,7 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	index = len(rf.log)
+	index = len(rf.log) + 1
 	term = rf.currentTerm
 	isLeader = rf.status == LEADER
 
@@ -423,7 +423,7 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 	}
 
 	rf.log = append(rf.log, LogEntry{term, command})
-	rf.DPritf(dClient, "new log append to leader [%d], appendLogTerm: %d, appednLogIndex: %d\n", rf.me, term, len(rf.log)-1)
+	rf.DPritf(dClient, "new log append to leader [%d], appendLogTerm: %d, appednLogIndex: %d\n", rf.me, term, len(rf.log))
 
 	// Your code here (2B).
 
@@ -464,10 +464,10 @@ func (rf *Raft) doHeartbeat() {
 			ni := rf.nextIndex[i]
 			prevLogIndex := ni - 1
 			prevLogTerm := -1
-			if prevLogIndex >= 0 {
-				prevLogTerm = rf.log[prevLogIndex].Term
+			if prevLogIndex > 0 {
+				prevLogTerm = rf.log[prevLogIndex-1].Term
 			}
-			entries := rf.log[ni:]
+			entries := rf.log[prevLogIndex:]
 
 			args := &AppendEntriesArgs{
 				Term:         rf.currentTerm,
@@ -520,7 +520,7 @@ func (rf *Raft) doHeartbeat() {
 							rf.DPritf(dLeader, "log entries {%d->%d} replicated to [%d] success\n", ni, ni+len(entries)-1, server)
 							rf.DPritf(dLeader, "for follower[%d], matchIndex: %d, nextIndex: %d", server, rf.matchIndex[server], rf.nextIndex[server])
 
-							for index := rf.commitIndex + 1; index < len(rf.log); index++ {
+							for index := rf.commitIndex + 1; index < len(rf.log)+1; index++ {
 								matchCount := 0
 								for j := range rf.peers {
 									if index <= rf.matchIndex[j] {
@@ -532,7 +532,7 @@ func (rf *Raft) doHeartbeat() {
 										rf.applyChan <- ApplyMsg{
 											CommandValid: true,
 											CommandIndex: index,
-											Command:      rf.log[index].Command,
+											Command:      rf.log[index-1].Command,
 										}
 									}
 								}
@@ -672,17 +672,17 @@ func (rf *Raft) setLeader() {
 	// set next log entry index sending to peers to
 	// leader's last log index+1 at the very beginning of being a leader
 	for i := range rf.nextIndex {
-		rf.nextIndex[i] = len(rf.log)
+		rf.nextIndex[i] = len(rf.log) + 1
 	}
 
 	// set highest match log entry index too peers
 	// i.e. only need to care about log entries after this index
-	// to -1 at the very beginning of being a leader
+	// to 0 at the very beginning of being a leader
 	// which stands for no matching log yet
 	for i := range rf.matchIndex {
-		rf.matchIndex[i] = -1
+		rf.matchIndex[i] = 0
 	}
-	rf.matchIndex[rf.me] = len(rf.log) - 1
+	rf.matchIndex[rf.me] = len(rf.log)
 }
 
 // expect the caller to hold the lock
@@ -703,11 +703,11 @@ func (rf *Raft) statusString() string {
 // get index, term of last log
 func (rf *Raft) lastLogInfo() (lastLogIndex, lastLogTerm int) {
 	if len(rf.log) != 0 {
-		lastLogIndex = len(rf.log) - 1
-		lastLogTerm = rf.log[lastLogIndex].Term
+		lastLogIndex = len(rf.log)
+		lastLogTerm = rf.log[lastLogIndex-1].Term
 		return
 	}
-	return -1, -1
+	return 0, 0
 }
 
 func (rf *Raft) heartbeatTicker(thisHeartbeatTerm int) {
@@ -819,8 +819,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 	rf.applyChan = applyCh
-	rf.commitIndex = -1
-	rf.lastApplied = -1
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
 
