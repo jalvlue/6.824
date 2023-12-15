@@ -302,6 +302,7 @@ type AppendEntriesReply struct {
 
 // append entries and heartbeat RPC
 // for lab 2A only heartbeat is implemented
+// for lab 2B log replication is implemented
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -335,59 +336,49 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.DPritf(dLog, "election ticker begin (%dms)\n", rf.electionTimeout.Milliseconds())
 	}
 
-	// heartbeat with log entries
-	if len(args.Entries) != 0 {
-		// not entries yet, just simply append leader's log
-		if len(rf.log) == 0 {
+	// check if log match with this prevLog
+	matchIdx := -1
+	// leader initialize
+	if args.PrevLogIndex == 0 {
+		matchIdx = 0
+		reply.Sussess = true
+	} else {
+		// leader have some logs before
+		for i, entry := range rf.log {
+			if i+1 == args.PrevLogIndex && entry.Term == args.PrevLogTerm {
+				matchIdx = i + 1
+				reply.Sussess = true
+				break
+			}
+		}
+	}
+
+	if reply.Sussess {
+		// heartbeat with log entries
+		if len(args.Entries) != 0 {
+			// discard mismatched logs
+			rf.log = rf.log[:matchIdx]
+			// append leader's log
 			rf.log = append(rf.log, args.Entries...)
-			reply.Sussess = true
 
-			index, term := rf.lastLogInfo()
-			rf.DPritf(dLog, "empty log, append leader's log, lastLogTerm: %d, lastLogIndex: %d\n", term, index)
+			followerLastIndex, followerLastTerm := rf.lastLogInfo()
+			rf.DPritf(dLog, "log replicated, matchTerm: %d, matchIndex: %d, lastLogTerm: %d, lastLogIndex: %d", args.PrevLogTerm, matchIdx, followerLastTerm, followerLastIndex)
+		}
 
-			if args.LeaderCommit > rf.commitIndex {
-				rf.commitIndex = args.LeaderCommit
+		if args.LeaderCommit > rf.commitIndex {
+
+			l := len(rf.log)
+			mn := matchIdx + len(args.Entries)
+			rf.DPritf(dLog, "log length: %d, match+new:", l, mn)
+
+			for i := rf.commitIndex + 1; i <= args.LeaderCommit && i <= len(rf.log) && i <= matchIdx+len(args.Entries); i++ {
+				rf.commitIndex++
 				rf.DPritf(dCommit, "commitIndex: %d", rf.commitIndex)
 				rf.applyChan <- ApplyMsg{
 					CommandValid: true,
 					CommandIndex: rf.commitIndex,
 					Command:      rf.log[rf.commitIndex-1].Command,
 				}
-			}
-		} else {
-			// have some entries before
-			for i, entry := range rf.log {
-				// look for the first match entry
-				index := i + 1
-				if index == args.PrevLogIndex && entry.Term == args.PrevLogTerm {
-					// discard mismatched logs
-					rf.log = rf.log[:index]
-					// append leader's log
-					rf.log = append(rf.log, args.Entries...)
-					followerLastIndex, followerLastTerm := rf.lastLogInfo()
-					rf.DPritf(dLog, "matchTerm: %d, matchIndex: %d, lastLogTerm: %d, lastLogIndex: %d", entry.Term, index, followerLastTerm, followerLastIndex)
-					// set success and commitIndex
-					reply.Sussess = true
-					if args.LeaderCommit > rf.commitIndex {
-						rf.commitIndex = args.LeaderCommit
-						rf.DPritf(dCommit, "commitIndex: %d", rf.commitIndex)
-						rf.applyChan <- ApplyMsg{
-							CommandValid: true,
-							CommandIndex: rf.commitIndex,
-							Command:      rf.log[rf.commitIndex-1].Command,
-						}
-					}
-				}
-			}
-		}
-	} else {
-		if args.LeaderCommit > rf.commitIndex {
-			rf.commitIndex = args.LeaderCommit
-			rf.DPritf(dCommit, "commitIndex: %d", rf.commitIndex)
-			rf.applyChan <- ApplyMsg{
-				CommandValid: true,
-				CommandIndex: rf.commitIndex,
-				Command:      rf.log[rf.commitIndex-1].Command,
 			}
 		}
 	}
@@ -423,7 +414,8 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 	}
 
 	rf.log = append(rf.log, LogEntry{term, command})
-	rf.DPritf(dClient, "new log append to leader [%d], appendLogTerm: %d, appednLogIndex: %d\n", rf.me, term, len(rf.log))
+	rf.matchIndex[rf.me] = len(rf.log)
+	rf.DPritf(dClient, "new log append to leader [%d], newLogTerm: %d, newLogIndex: %d\n", rf.me, term, len(rf.log))
 
 	// Your code here (2B).
 
@@ -511,15 +503,15 @@ func (rf *Raft) doHeartbeat() {
 
 					rf.DPritf(dLog, "heartbeatRPC to [%d] success\n", server)
 
-					// with log entry
-					if len(args.Entries) != 0 {
-						// replicated success
-						if reply.Sussess {
+					// replicated success
+					if reply.Sussess {
+						if len(entries) != 0 {
 							rf.matchIndex[server] = ni + len(entries) - 1
 							rf.nextIndex[server] = ni + len(entries)
 							rf.DPritf(dLeader, "log entries {%d->%d} replicated to [%d] success\n", ni, ni+len(entries)-1, server)
 							rf.DPritf(dLeader, "for follower[%d], matchIndex: %d, nextIndex: %d", server, rf.matchIndex[server], rf.nextIndex[server])
 
+							rf.DPritf(dLeader, "check if have some entries to commit, leaderCommitIndex: {%d}, leaderLastIndex: {%d}", rf.commitIndex, len(rf.log))
 							for index := rf.commitIndex + 1; index < len(rf.log)+1; index++ {
 								matchCount := 0
 								for j := range rf.peers {
@@ -537,13 +529,15 @@ func (rf *Raft) doHeartbeat() {
 									}
 								}
 							}
-						} else {
-							// heartbeat success, but AE fail
-							// decrement the nextIndex to this server
-							// and wait for next AE try
-							rf.nextIndex[server]--
-							rf.DPritf(dLog, "prevLogIndex not match, decrement nextIndex for [%d]\n", server)
 						}
+					} else {
+						// heartbeat success, but AE fail
+						// the follower have not prevLogIndex & prevLogTerm
+						// in its log entries
+						// decrement the nextIndex to this server
+						// and wait for next AE try
+						rf.nextIndex[server]--
+						rf.DPritf(dLog, "prevLogIndex not match, decrement nextIndex for [%d]\n", server)
 					}
 				}
 				// } else {
