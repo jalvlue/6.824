@@ -196,46 +196,31 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.VoteGranted = false
 	reply.Status = rf.status
 
+	// in a higher term
+	// no voet granted
 	if rf.currentTerm > args.Term {
-		// in a higher term
-		// no voet granted
 		rf.DPritf(dVote, "in a higher term, no vote granted to [%d]\n", args.CandidateID)
 		return
 	}
 
-	lastIndex, lastTerm := rf.lastLogInfo()
-
-	if rf.currentTerm == args.Term &&
-		(rf.votedFor == NO_VOTE || rf.votedFor == args.CandidateID) ||
-		rf.currentTerm < args.Term &&
-			(args.LastLogTerm > lastTerm ||
-				(args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIndex)) {
-		rf.DPritf(dVote, "vote granted to [%d]\n", args.CandidateID)
-		reply.VoteGranted = true
+	// in a lower term
+	// convert to a follower of this term
+	// but no vote yet, check if vote to candidate later
+	if rf.currentTerm < args.Term {
+		rf.DPritf(dVote, "in a lower term, convert to follower\n")
+		rf.setFollower(args.Term, NO_VOTE)
+		go rf.electionTicker(rf.currentTerm)
+		rf.DPritf(dVote, "election ticker begin(%dms)\n", rf.electionTimeout.Milliseconds())
 	}
 
-	if reply.VoteGranted {
-		if rf.currentTerm < args.Term {
-			// in a lower term
-			// convert to follower to candidate of this term
+	lastIndex, lastTerm := rf.lastLogInfo()
 
-			rf.DPritf(dVote, "in a lower term, convert to follow\n")
-			rf.setFollower(args.Term, args.CandidateID)
-			rf.resetElectionTime()
-			// the older term election ticker would detect the new term
-			// and return
-			// new term election ticker would be launched
-			go rf.electionTicker(rf.currentTerm)
-			rf.DPritf(dVote, "election ticker begin (%dms)\n", rf.electionTimeout.Milliseconds())
-		} else {
-			// rf.currentTerm == args.Term
-			// in the same term
-
-			// not voted yet, and not newer than the cnadidate, vote granted
-			rf.setFollower(args.Term, args.CandidateID)
-			rf.resetElectionTime()
-			rf.DPritf(dVote, "in the same term but no voted, vote granted to [%d]\n", args.CandidateID)
-		}
+	// vote granted if no vote and have out-of-date logs
+	if (rf.votedFor == NO_VOTE || rf.votedFor == args.CandidateID) &&
+		(args.LastLogTerm > lastTerm ||
+			(args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIndex)) {
+		rf.DPritf(dVote, "vote granted to [%d]\n", args.CandidateID)
+		reply.VoteGranted = true
 	} else {
 		rf.DPritf(dVote, "no vote granted to candidate [%d]", args.CandidateID)
 	}
@@ -473,7 +458,7 @@ func (rf *Raft) doHeartbeat() {
 			if len(entries) == 0 {
 				rf.DPritf(dTimer, "send heartbeat RPC to [%d]\n", i)
 			} else {
-				rf.DPritf(dTimer, "send AppendEntries RPC {%v} RPC to [%d]\n", entries, i)
+				rf.DPritf(dTimer, "send AppendEntries RPC {%d->%d} RPC to [%d]\n", ni, ni+len(entries)-1, i)
 			}
 
 			go func(server int) {
@@ -628,16 +613,24 @@ func (rf *Raft) startElection(savedCandidateTerm int) {
 
 							return
 						}
-
 					} else {
-						rf.DPritf(dVote, "RequestVote RPC to [%d] failed\n", server)
-						// TODO: record and resend
-
-						// this would take 1600+ms
-						// just simply ignore it
-						return
+						// no vote granted from valid leader of this term
+						// convert to follower
+						// and reset election ticker of this term
+						if reply.Status == LEADER {
+							rf.setFollower(rf.currentTerm, rf.me)
+							rf.resetElectionTime()
+							rf.DPritf(dVote, "come across with valid leader, election abort\n")
+							rf.DPritf(dTimer, "convert to follower, election ticker reset (%dms)\n", rf.electionTimeout.Milliseconds())
+						}
 					}
 				}
+				// else {
+				// 	rf.DPritf(dVote, "RequestVote RPC to [%d] failed\n", server)
+				// 	// this would take 1600+ms
+				// 	// just simply ignore it
+				// 	return
+				// }
 			}(i)
 		}
 	}

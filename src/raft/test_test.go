@@ -516,6 +516,8 @@ func TestBackup2B(t *testing.T) {
 	cfg.disconnect((leader1 + 2) % servers)
 	cfg.disconnect((leader1 + 3) % servers)
 	cfg.disconnect((leader1 + 4) % servers)
+	log.Printf("#Test (2B): disconnect 3 followers [%d %d %d]\n", ((leader1 + 2) % servers), ((leader1 + 3) % servers), ((leader1 + 4) % servers))
+	log.Printf("#Test (2B): put leader [%d] and follower [%d] in a partition, so they won't commit any logs\n", (leader1 % servers), ((leader1 + 1) % servers))
 
 	// submit lots of commands that won't commit
 	for i := 0; i < 50; i++ {
@@ -532,6 +534,9 @@ func TestBackup2B(t *testing.T) {
 	cfg.connect((leader1 + 3) % servers)
 	cfg.connect((leader1 + 4) % servers)
 
+	log.Printf("#Test (2B): disconect leader [%d] and follower [%d] in the partition\n", (leader1 % servers), ((leader1 + 1) % servers))
+	log.Printf("#Test (2B): reconnect 3 followers [%d %d %d], so they could re-election and commit logs\n", ((leader1 + 2) % servers), ((leader1 + 3) % servers), ((leader1 + 4) % servers))
+
 	// lots of successful commands to new group.
 	for i := 0; i < 50; i++ {
 		cfg.one(rand.Int(), 3, true)
@@ -540,10 +545,18 @@ func TestBackup2B(t *testing.T) {
 	// now another partitioned leader and one follower
 	leader2 := cfg.checkOneLeader()
 	other := (leader1 + 2) % servers
+	another := (leader1 + 3) % servers
 	if leader2 == other {
 		other = (leader2 + 1) % servers
+		another = (leader2 + 2) % servers
+	} else {
+		if another == leader2 {
+			another = (leader2 + 1) % servers
+		}
 	}
 	cfg.disconnect(other)
+	log.Printf("#Test (2B): disconect follower [%d]\n", other)
+	log.Printf("#Test (2B): put leader [%d] and follower [%d] in a partition, so they won't commit any logs\n", (leader2 % servers), another)
 
 	// lots more commands that won't commit
 	for i := 0; i < 50; i++ {
@@ -559,12 +572,15 @@ func TestBackup2B(t *testing.T) {
 	cfg.connect((leader1 + 0) % servers)
 	cfg.connect((leader1 + 1) % servers)
 	cfg.connect(other)
+	log.Printf("#Test (2B): disconect all follower \n")
+	log.Printf("#Test (2B): re-connect leader [%d] and followers [%d, %d], so they could commit logs\n", ((leader1 + 0) % servers), ((leader1 + 1) % servers), other)
 
 	// lots of successful commands to new group.
 	for i := 0; i < 50; i++ {
 		cfg.one(rand.Int(), 3, true)
 	}
 
+	log.Printf("#Test (2B): connect all follower \n")
 	// now everyone
 	for i := 0; i < servers; i++ {
 		cfg.connect(i)
