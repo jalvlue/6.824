@@ -216,11 +216,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	lastIndex, lastTerm := rf.lastLogInfo()
 
 	// vote granted if no vote and have out-of-date logs
-	if (rf.votedFor == NO_VOTE || rf.votedFor == args.CandidateID) &&
+	if rf.votedFor == NO_VOTE &&
 		(args.LastLogTerm > lastTerm ||
 			(args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIndex)) {
 		rf.DPritf(dVote, "vote granted to [%d]\n", args.CandidateID)
 		reply.VoteGranted = true
+		rf.votedFor = args.CandidateID
 	} else {
 		rf.DPritf(dVote, "no vote granted to candidate [%d]", args.CandidateID)
 	}
