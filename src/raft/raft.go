@@ -63,7 +63,7 @@ const (
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	// TODO: use RWMutex instead of Mutex for better performance
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	mu        sync.RWMutex        // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -108,8 +108,8 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
 
 	term = rf.currentTerm
 	isleader = rf.status == LEADER
@@ -423,7 +423,7 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-// expect the caller to hold the lock
+// expect the caller to hold the read lock
 // launch a bunch of goroutines to
 // send heartbeat/appendEntries RPCs to all other peers
 // and return immediately
@@ -668,7 +668,7 @@ func (rf *Raft) setLeader() {
 	rf.matchIndex[rf.me] = len(rf.log)
 }
 
-// expect the caller to hold the lock
+// expect the caller to hold the read lock
 func (rf *Raft) statusString() string {
 	switch rf.status {
 	case FOLLOWER:
@@ -696,21 +696,21 @@ func (rf *Raft) lastLogInfo() (lastLogIndex, lastLogTerm int) {
 func (rf *Raft) heartbeatTicker(thisHeartbeatTerm int) {
 	for !rf.killed() {
 
-		rf.mu.Lock()
+		rf.mu.RLock()
 
 		if rf.currentTerm != thisHeartbeatTerm {
 			rf.DPritf(dTimer, "newer term detected heartbeat ticker term_%d abort\n", thisHeartbeatTerm)
-			rf.mu.Unlock()
+			rf.mu.RUnlock()
 			return
 		}
 
 		if rf.status != LEADER {
 			rf.DPritf(dTimer, "no longer a leader, heartbeat ticker term_%d abort\n", thisHeartbeatTerm)
-			rf.mu.Unlock()
+			rf.mu.RUnlock()
 			return
 		} else {
 			rf.doHeartbeat()
-			rf.mu.Unlock()
+			rf.mu.RUnlock()
 		}
 
 		time.Sleep(HEARTHEAT_INTERVAL)
@@ -730,19 +730,19 @@ func (rf *Raft) electionTicker(thisElectionTerm int) {
 		// Check if a leader election should be started.
 
 		time.Sleep(20 * time.Millisecond)
-		rf.mu.Lock()
+		rf.mu.RLock()
 
 		// this election ticker is no longer needed
 		if rf.currentTerm != thisElectionTerm {
 			rf.DPritf(dTimer, "newer term detected election ticker term_%d abort\n", thisElectionTerm)
-			rf.mu.Unlock()
+			rf.mu.RUnlock()
 			return
 		}
 
 		// the leader would not start election
 		if rf.status == LEADER {
 			rf.DPritf(dTimer, "already a leader, election ticker term_%d abort\n", thisElectionTerm)
-			rf.mu.Unlock()
+			rf.mu.RUnlock()
 			return
 		}
 
@@ -750,6 +750,9 @@ func (rf *Raft) electionTicker(thisElectionTerm int) {
 		if time.Now().After(rf.electionTime) {
 			rf.DPritf(dTimer, "election timeout, prepare to election\n")
 
+			rf.mu.RUnlock()
+
+			rf.mu.Lock()
 			rf.setCandidate()
 			rf.resetElectionTime()
 			rf.startElection(rf.currentTerm)
@@ -760,7 +763,7 @@ func (rf *Raft) electionTicker(thisElectionTerm int) {
 			rf.mu.Unlock()
 			return
 		}
-		rf.mu.Unlock()
+		rf.mu.RUnlock()
 	}
 }
 
@@ -775,7 +778,7 @@ func randomTimeout() time.Duration {
 	return time.Duration(300+rand.Intn(150)) * time.Millisecond
 }
 
-// expect the caller to hold the lock
+// expect the caller to hold the read lock
 func (rf *Raft) DPritf(topic logTopic, format string, a ...interface{}) {
 	if DebugVerbosity >= 1 {
 		time := time.Since(DebugStart).Milliseconds()
