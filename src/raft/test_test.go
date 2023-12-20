@@ -572,7 +572,7 @@ func TestBackup2B(t *testing.T) {
 	cfg.connect((leader1 + 0) % servers)
 	cfg.connect((leader1 + 1) % servers)
 	cfg.connect(other)
-	log.Printf("#Test (2B): disconect all follower \n")
+	log.Printf("#Test (2B): disconect all servers\n")
 	log.Printf("#Test (2B): re-connect leader [%d] and followers [%d, %d], so they could commit logs\n", ((leader1 + 0) % servers), ((leader1 + 1) % servers), other)
 
 	// lots of successful commands to new group.
@@ -580,11 +580,11 @@ func TestBackup2B(t *testing.T) {
 		cfg.one(rand.Int(), 3, true)
 	}
 
-	log.Printf("#Test (2B): connect all follower \n")
 	// now everyone
 	for i := 0; i < servers; i++ {
 		cfg.connect(i)
 	}
+	log.Printf("#Test (2B): connect all servers\n")
 	cfg.one(rand.Int(), servers, true)
 
 	cfg.end()

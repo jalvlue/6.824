@@ -62,6 +62,7 @@ const (
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
+	// TODO: use RWMutex instead of Mutex for better performance
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
@@ -77,14 +78,13 @@ type Raft struct {
 	votedFor    int
 	log         []LogEntry
 
+	// volatile state on all servers
+	commitIndex     int
+	lastApplied     int
+	status          byte
+	applyChan       chan ApplyMsg
 	electionTimeout time.Duration
 	electionTime    time.Time
-
-	// volatile state on all servers
-	commitIndex int
-	lastApplied int
-	status      byte
-	applyChan   chan ApplyMsg
 
 	// volatile state on leaders
 	// for each server, index of the next log entry
@@ -197,7 +197,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Status = rf.status
 
 	// in a higher term
-	// no voet granted
+	// no vote granted
 	if rf.currentTerm > args.Term {
 		rf.DPritf(dVote, "in a higher term, no vote granted to [%d]\n", args.CandidateID)
 		return
@@ -207,8 +207,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// convert to a follower of this term
 	// but no vote yet, check if vote to candidate later
 	if rf.currentTerm < args.Term {
-		rf.DPritf(dVote, "in a lower term, convert to follower\n")
+		rf.DPritf(dVote, "in a lower term, convert to follower of this term\n")
 		rf.setFollower(args.Term, NO_VOTE)
+		reply.Status = FOLLOWER
 		go rf.electionTicker(rf.currentTerm)
 		rf.DPritf(dVote, "election ticker begin(%dms)\n", rf.electionTimeout.Milliseconds())
 	}
@@ -352,12 +353,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 
 		if args.LeaderCommit > rf.commitIndex {
-
-			l := len(rf.log)
-			mn := matchIdx + len(args.Entries)
-			rf.DPritf(dLog, "log length: %d, match+new:", l, mn)
-
-			for i := rf.commitIndex + 1; i <= args.LeaderCommit && i <= len(rf.log) && i <= matchIdx+len(args.Entries); i++ {
+			for i := rf.commitIndex + 1; i <= args.LeaderCommit && i <= len(rf.log); i++ {
 				rf.commitIndex++
 				rf.DPritf(dCommit, "commitIndex: %d", rf.commitIndex)
 				rf.applyChan <- ApplyMsg{
@@ -445,7 +441,8 @@ func (rf *Raft) doHeartbeat() {
 			if prevLogIndex > 0 {
 				prevLogTerm = rf.log[prevLogIndex-1].Term
 			}
-			entries := rf.log[prevLogIndex:]
+			entries := make([]LogEntry, len(rf.log)-prevLogIndex)
+			copy(entries, rf.log[prevLogIndex:])
 
 			args := &AppendEntriesArgs{
 				Term:         rf.currentTerm,
@@ -457,9 +454,9 @@ func (rf *Raft) doHeartbeat() {
 			}
 
 			if len(entries) == 0 {
-				rf.DPritf(dTimer, "send heartbeat RPC to [%d]\n", i)
+				rf.DPritf(dLog, "send heartbeat RPC to [%d]\n", i)
 			} else {
-				rf.DPritf(dTimer, "send AppendEntries RPC {%d->%d} RPC to [%d]\n", ni, ni+len(entries)-1, i)
+				rf.DPritf(dLog, "send AppendEntries RPC {%d->%d} RPC to [%d]\n", ni, ni+len(entries)-1, i)
 			}
 
 			go func(server int) {
@@ -472,11 +469,6 @@ func (rf *Raft) doHeartbeat() {
 
 					rf.DPritf(dTimer, "receive heartbeat RPC reply from [%d], {%v}\n", server, reply)
 
-					if rf.status != LEADER {
-						rf.DPritf(dLog, "no longer a leader, discard reply")
-						return
-					}
-
 					if reply.Term > rf.currentTerm {
 						rf.setFollower(reply.Term, NO_VOTE)
 						rf.resetElectionTime()
@@ -484,6 +476,11 @@ func (rf *Raft) doHeartbeat() {
 
 						rf.DPritf(dTimer, "lagging behind other peers, heartbeat abort, convert to follower\n")
 						rf.DPritf(dTimer, "election ticker begin (%dms)\n", rf.electionTimeout.Milliseconds())
+						return
+					}
+
+					if rf.status != LEADER {
+						rf.DPritf(dLog, "no longer a leader, discard reply")
 						return
 					}
 
@@ -635,8 +632,6 @@ func (rf *Raft) startElection(savedCandidateTerm int) {
 			}(i)
 		}
 	}
-
-	go rf.electionTicker(rf.currentTerm)
 }
 
 // expect the caller to hold the lock
@@ -758,6 +753,10 @@ func (rf *Raft) electionTicker(thisElectionTerm int) {
 			rf.setCandidate()
 			rf.resetElectionTime()
 			rf.startElection(rf.currentTerm)
+
+			// begin a election timer of the new term
+			go rf.electionTicker(rf.currentTerm)
+
 			rf.mu.Unlock()
 			return
 		}
