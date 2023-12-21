@@ -862,6 +862,7 @@ func TestFigure82C(t *testing.T) {
 		if leader != -1 {
 			cfg.crash1(leader)
 			nup -= 1
+			log.Printf("#Test (2C): crash leader [%d]\n", leader)
 		}
 
 		if nup < 3 {
@@ -870,6 +871,7 @@ func TestFigure82C(t *testing.T) {
 				cfg.start1(s, cfg.applier)
 				cfg.connect(s)
 				nup += 1
+				log.Printf("#Test (2C): start server [%d]\n", s)
 			}
 		}
 	}
@@ -878,8 +880,11 @@ func TestFigure82C(t *testing.T) {
 		if cfg.rafts[i] == nil {
 			cfg.start1(i, cfg.applier)
 			cfg.connect(i)
+			log.Printf("#Test (2C): start server [%d]\n", i)
 		}
 	}
+
+	log.Println("#Test (2C): start all servers and request a command")
 
 	cfg.one(rand.Int(), servers, true)
 

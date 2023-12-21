@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"fmt"
 	"log"
 	"math/rand"
@@ -28,6 +29,7 @@ import (
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -133,6 +135,36 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+
+	// expect the caller to hold the lock
+	// rf.mu.RLock()
+	// defer rf.mu.RUnlock()
+
+	start := time.Now()
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	pLog := make([]LogEntry, len(rf.log))
+	copy(pLog, rf.log)
+
+	persistState := PersistState{
+		Term:     rf.currentTerm,
+		VotedFor: rf.votedFor,
+		Log:      pLog,
+	}
+
+	e.Encode(persistState)
+	rf.persister.Save(w.Bytes(), nil)
+
+	elapsed := time.Since(start)
+	rf.DPritf(dPersist, "write persist success, takes (%dms)", elapsed.Milliseconds())
+}
+
+type PersistState struct {
+	Term     int
+	VotedFor int
+	Log      []LogEntry
 }
 
 // restore previously persisted state.
@@ -153,6 +185,29 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	// expect the caller to hold the lock
+	// rf.mu.Lock()
+	// rf.mu.Unlock()
+
+	start := time.Now()
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var persistState PersistState
+
+	if err := d.Decode(&persistState); err != nil {
+		panic("decode fail\n")
+	} else {
+		rf.currentTerm = persistState.Term
+		rf.votedFor = persistState.VotedFor
+		rf.log = make([]LogEntry, len(persistState.Log))
+		copy(rf.log, persistState.Log)
+	}
+
+	elapsed := time.Since(start)
+	rf.DPritf(dPersist, "read persist success, takes (%dms)", elapsed.Milliseconds())
 }
 
 // the service says it has created a snapshot that has
@@ -203,12 +258,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
+	doPersist := false
+
 	// in a lower term
 	// convert to a follower of this term
 	// but no vote yet, check if vote to candidate later
 	if rf.currentTerm < args.Term {
 		rf.DPritf(dVote, "in a lower term, convert to follower of this term\n")
 		rf.setFollower(args.Term, NO_VOTE)
+		doPersist = true
 		reply.Status = FOLLOWER
 		go rf.electionTicker(rf.currentTerm)
 		rf.DPritf(dVote, "election ticker begin(%dms)\n", rf.electionTimeout.Milliseconds())
@@ -223,8 +281,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.DPritf(dVote, "vote granted to [%d]\n", args.CandidateID)
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateID
+		doPersist = true
 	} else {
 		rf.DPritf(dVote, "no vote granted to candidate [%d]", args.CandidateID)
+	}
+
+	if doPersist {
+		rf.persist()
 	}
 }
 
@@ -299,6 +362,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	reply.Sussess = false
 
+	doPersist := false
+
 	if rf.currentTerm > args.Term {
 		// in a higher term
 		rf.DPritf(dLog, "in a higher term, ignore heartbeat and notify leader [%d]\n", args.LeaderID)
@@ -306,7 +371,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else if rf.currentTerm == args.Term {
 		// in the same term
 		if rf.status != FOLLOWER {
-			rf.setFollower(args.Term, NO_VOTE)
+			rf.status = FOLLOWER
+			doPersist = true
 		}
 		rf.resetElectionTime()
 	} else {
@@ -315,6 +381,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		rf.DPritf(dLog, "in a lower term, convert to follower\n")
 		rf.setFollower(args.Term, NO_VOTE)
+		doPersist = true
 		rf.resetElectionTime()
 		// the older term election ticker would detect the new term
 		// and return
@@ -350,6 +417,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 			followerLastIndex, followerLastTerm := rf.lastLogInfo()
 			rf.DPritf(dLog, "log replicated, matchTerm: %d, matchIndex: %d, lastLogTerm: %d, lastLogIndex: %d", args.PrevLogTerm, matchIdx, followerLastTerm, followerLastIndex)
+			doPersist = true
 		}
 
 		if args.LeaderCommit > rf.commitIndex {
@@ -363,6 +431,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				}
 			}
 		}
+	}
+
+	if doPersist {
+		rf.persist()
 	}
 }
 
@@ -398,6 +470,7 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 	rf.log = append(rf.log, LogEntry{term, command})
 	rf.matchIndex[rf.me] = len(rf.log)
 	rf.DPritf(dClient, "new log append to leader [%d], newLogTerm: %d, newLogIndex: %d\n", rf.me, term, len(rf.log))
+	rf.persist()
 
 	// Your code here (2B).
 
@@ -476,6 +549,8 @@ func (rf *Raft) doHeartbeat() {
 
 						rf.DPritf(dTimer, "lagging behind other peers, heartbeat abort, convert to follower\n")
 						rf.DPritf(dTimer, "election ticker begin (%dms)\n", rf.electionTimeout.Milliseconds())
+
+						rf.persist()
 						return
 					}
 
@@ -587,10 +662,11 @@ func (rf *Raft) startElection(savedCandidateTerm int) {
 						return
 					}
 
-					if reply.Term > savedCandidateTerm {
+					if reply.Term > rf.currentTerm {
 						// lagging behind other peers
 						// convert to follower and set to new term immediately
 						rf.setFollower(reply.Term, NO_VOTE)
+						rf.persist()
 						rf.resetElectionTime()
 						go rf.electionTicker(rf.currentTerm)
 						rf.DPritf(dVote, "lagging behind other peers, election abort, convert to follower\n")
@@ -756,6 +832,7 @@ func (rf *Raft) electionTicker(thisElectionTerm int) {
 			rf.setCandidate()
 			rf.resetElectionTime()
 			rf.startElection(rf.currentTerm)
+			rf.persist()
 
 			// begin a election timer of the new term
 			go rf.electionTicker(rf.currentTerm)
