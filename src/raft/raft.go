@@ -64,7 +64,6 @@ const (
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	// TODO: use RWMutex instead of Mutex for better performance
 	mu        sync.RWMutex        // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
@@ -145,23 +144,27 @@ func (rf *Raft) persist() {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 
-	pLog := make([]LogEntry, len(rf.log))
-	copy(pLog, rf.log)
+	// persister.Save would just clone a copy of args
+	// so there is not need to create a new copy of log
+	// pLog := make([]LogEntry, len(rf.log))
+	// copy(pLog, rf.log)
 
-	persistState := PersistState{
+	persistState := persistStates{
 		Term:     rf.currentTerm,
 		VotedFor: rf.votedFor,
-		Log:      pLog,
+		Log:      rf.log,
 	}
 
-	e.Encode(persistState)
+	if err := e.Encode(persistState); err != nil {
+		panic(fmt.Errorf("persist encode fail: %w", err))
+	}
 	rf.persister.Save(w.Bytes(), nil)
 
 	elapsed := time.Since(start)
-	rf.DPritf(dPersist, "write persist success, takes (%dms)", elapsed.Milliseconds())
+	rf.DPritf(dPersist, "write persist success, takes (%dms), currentTerm: %d, votedFor:%d, lastLogIndex: %d\n", elapsed.Milliseconds(), rf.currentTerm, rf.votedFor, len(rf.log))
 }
 
-type PersistState struct {
+type persistStates struct {
 	Term     int
 	VotedFor int
 	Log      []LogEntry
@@ -186,28 +189,32 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.yyy = yyy
 	// }
 
-	// expect the caller to hold the lock
-	// rf.mu.Lock()
-	// rf.mu.Unlock()
-
 	start := time.Now()
 
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 
-	var persistState PersistState
+	var ps persistStates
 
-	if err := d.Decode(&persistState); err != nil {
-		panic("decode fail\n")
+	if err := d.Decode(&ps); err != nil {
+		panic(fmt.Errorf("persist decode fail: %w", err))
 	} else {
-		rf.currentTerm = persistState.Term
-		rf.votedFor = persistState.VotedFor
-		rf.log = make([]LogEntry, len(persistState.Log))
-		copy(rf.log, persistState.Log)
+		rf.currentTerm = ps.Term
+		rf.votedFor = ps.VotedFor
+
+		// rf.log = make([]LogEntry, len(ps.Log))
+		// copy(rf.log, ps.Log)
+
+		// The data, which comes from persister.ReadRaftState
+		// is a copy of persister.raftState
+		// so just point rf.log to ps.Log
+		// since it is a copy
+		rf.log = ps.Log
 	}
 
 	elapsed := time.Since(start)
-	rf.DPritf(dPersist, "read persist success, takes (%dms)", elapsed.Milliseconds())
+	lastLogIndex, lastLogTerm := rf.lastLogInfo()
+	rf.DPritf(dPersist, "read persist success, takes (%dms), currentTerm: %d, votedFor:%d, lastLogTerm: %d, lastLogIndex: %d\n", elapsed.Milliseconds(), rf.currentTerm, rf.votedFor, lastLogTerm, lastLogIndex)
 }
 
 // the service says it has created a snapshot that has
@@ -357,7 +364,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.DPritf(dLog, "receive AppendEntries RPC from [%d]\n", args.LeaderID)
+	if len(args.Entries) == 0 {
+		rf.DPritf(dLog, "receive heartbeat RPC from [%d]\n", args.LeaderID)
+	} else {
+		rf.DPritf(dLog, "receive AppendEntries RPC from [%d]\n", args.LeaderID)
+	}
 
 	reply.Term = rf.currentTerm
 	reply.Sussess = false
@@ -613,100 +624,123 @@ func (rf *Raft) doHeartbeat() {
 	// rf.debugLogger.Printf(" %v, term_%v>: heartbeat RPCs done, epalse: %vms\n", statusString(leaderStatus), leaderTerm, epalseMs)
 }
 
-// expect the caller to hold the lock
-// launch a bunch of goroutines and return immediately
-func (rf *Raft) startElection(savedCandidateTerm int) {
-	rf.DPritf(dVote, "begin election\n")
+// send and re-send RV RPCs to all peers in this election timeout
+func (rf *Raft) doElection(savedCandidateTerm int) {
 
 	voteReceived := 1
+	hasReply := make([]bool, len(rf.peers))
+	electionDone := false
 
-	for i := 0; i < len(rf.peers); i++ {
-		if i != rf.me {
-			// send request vote RPCs to all other peers
-			savedLastLogIndex, savedLastLogTerm := rf.lastLogInfo()
-			args := &RequestVoteArgs{
-				Term:         savedCandidateTerm,
-				CandidateID:  rf.me,
-				LastLogIndex: savedLastLogIndex,
-				LastLogTerm:  savedLastLogTerm,
-			}
-			rf.DPritf(dVote, "send RequestVote RPC to [%d]\n", i)
+	for !rf.killed() {
 
-			go func(server int) {
-				reply := &RequestVoteReply{}
+		rf.mu.RLock()
+		if rf.currentTerm != savedCandidateTerm || rf.status != CANDIDATE {
+			rf.DPritf(dDrop, "election term_%d done\n", savedCandidateTerm)
+			electionDone = true
+			rf.mu.RUnlock()
+			return
+		}
 
-				ok := rf.sendRequestVote(server, args, reply)
-				if ok {
-					rf.mu.Lock()
-					defer rf.mu.Unlock()
+		savedLastLogIndex, savedLastLogTerm := rf.lastLogInfo()
+		for i := 0; i < len(rf.peers); i++ {
+			if i != rf.me && !hasReply[i] {
 
-					rf.DPritf(dVote, "receive RequestVote RPC reply from [%d], {%v}\n", server, reply)
+				// send request vote RPCs to all other peers
+				args := &RequestVoteArgs{
+					Term:         savedCandidateTerm,
+					CandidateID:  rf.me,
+					LastLogIndex: savedLastLogIndex,
+					LastLogTerm:  savedLastLogTerm,
+				}
+				rf.DPritf(dVote, "send RequestVote RPC to [%d]\n", i)
 
-					// handle reply in each goroutine
-					// so that if a reply is receive within timeout
-					// the gouroutine would grab the lock and handle it
-					// (change the candidate's state)
-					// if a reply is receive after timeout
-					// i.e. a new term is detected
-					// the goroutine just simply return
+				go func(server int) {
+					reply := &RequestVoteReply{}
 
-					if rf.status != CANDIDATE {
-						// no longer a candidate
-						rf.DPritf(dVote, "no longer a candidate, ignore reply\n")
-						return
-					}
+					ok := rf.sendRequestVote(server, args, reply)
+					if ok {
+						rf.mu.Lock()
+						defer rf.mu.Unlock()
 
-					if savedCandidateTerm < rf.currentTerm {
-						// this election is no longer needed
-						rf.DPritf(dVote, "new term detected, election abort\n")
-						return
-					}
+						hasReply[server] = true
 
-					if reply.Term > rf.currentTerm {
-						// lagging behind other peers
-						// convert to follower and set to new term immediately
-						rf.setFollower(reply.Term, NO_VOTE)
-						rf.persist()
-						rf.resetElectionTime()
-						go rf.electionTicker(rf.currentTerm)
-						rf.DPritf(dVote, "lagging behind other peers, election abort, convert to follower\n")
-						rf.DPritf(dTimer, "election ticker begin (%dms)\n", rf.electionTimeout.Milliseconds())
-						return
-					}
+						rf.DPritf(dVote, "receive RequestVote RPC reply from [%d], {%v}\n", server, reply)
 
-					if reply.VoteGranted {
-						voteReceived++
-						rf.DPritf(dVote, "vote granted from [%d], voteCount: %d/%d\n", server, voteReceived, len(rf.peers))
-
-						if voteReceived*2 > len(rf.peers) {
-							rf.DPritf(dVote, "won election\n")
-							rf.DPritf(dTimer, "heartbeat ticker begin\n")
-
-							rf.setLeader()
-							go rf.heartbeatTicker(rf.currentTerm)
-
+						if electionDone {
+							rf.DPritf(dDrop, "election done, ignore reply from [%d]\n", server)
 							return
 						}
-					} else {
-						// no vote granted from valid leader of this term
-						// convert to follower
-						// and reset election ticker of this term
-						if reply.Status == LEADER {
-							rf.setFollower(rf.currentTerm, rf.me)
+
+						// handle reply in each goroutine
+						// so that if a reply is receive within timeout
+						// the gouroutine would grab the lock and handle it
+						// (change the candidate's state)
+						// if a reply is receive after timeout
+						// i.e. a new term is detected
+						// the goroutine just simply return
+
+						if rf.status != CANDIDATE {
+							// no longer a candidate
+							rf.DPritf(dVote, "no longer a candidate, ignore reply\n")
+							return
+						}
+
+						if savedCandidateTerm < rf.currentTerm {
+							// this election is no longer needed
+							rf.DPritf(dVote, "new term detected, ignore reply\n")
+							return
+						}
+
+						if reply.Term > rf.currentTerm {
+							// lagging behind other peers
+							// convert to follower and set to new term immediately
+							rf.setFollower(reply.Term, NO_VOTE)
+							rf.persist()
 							rf.resetElectionTime()
-							rf.DPritf(dVote, "come across with valid leader, election abort\n")
-							rf.DPritf(dTimer, "convert to follower, election ticker reset (%dms)\n", rf.electionTimeout.Milliseconds())
+							go rf.electionTicker(rf.currentTerm)
+							rf.DPritf(dDrop, "lagging behind other peers, election abort, convert to follower\n")
+							rf.DPritf(dTimer, "election ticker begin (%dms)\n", rf.electionTimeout.Milliseconds())
+							return
+						}
+
+						if reply.VoteGranted {
+							voteReceived++
+							rf.DPritf(dVote, "vote granted from [%d], voteCount: %d/%d\n", server, voteReceived, len(rf.peers))
+
+							if voteReceived*2 > len(rf.peers) {
+								rf.DPritf(dVote, "won election\n")
+								rf.DPritf(dTimer, "heartbeat ticker begin\n")
+
+								rf.setLeader()
+								go rf.heartbeatTicker(rf.currentTerm)
+
+								return
+							}
+						} else {
+							// no vote granted from valid leader of this term
+							// convert to follower
+							// and reset election ticker of this term
+							if reply.Status == LEADER {
+								rf.setFollower(rf.currentTerm, rf.me)
+								rf.resetElectionTime()
+								rf.DPritf(dVote, "come across with valid leader, election abort\n")
+								rf.DPritf(dTimer, "convert to follower, election ticker reset (%dms)\n", rf.electionTimeout.Milliseconds())
+							}
 						}
 					}
-				}
-				// else {
-				// 	rf.DPritf(dVote, "RequestVote RPC to [%d] failed\n", server)
-				// 	// this would take 1600+ms
-				// 	// just simply ignore it
-				// 	return
-				// }
-			}(i)
+					// else {
+					// 	rf.DPritf(dVote, "RequestVote RPC to [%d] failed\n", server)
+					// 	// this would take 1600+ms
+					// 	// just simply ignore it
+					// 	return
+					// }
+				}(i)
+			}
 		}
+
+		rf.mu.RUnlock()
+
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -729,7 +763,8 @@ func (rf *Raft) setLeader() {
 	rf.status = LEADER
 
 	// set next log entry index sending to peers to
-	// leader's last log index+1 at the very beginning of being a leader
+	// leader's last log index+1
+	// at the very beginning of being a leader
 	for i := range rf.nextIndex {
 		rf.nextIndex[i] = len(rf.log) + 1
 	}
@@ -769,19 +804,20 @@ func (rf *Raft) lastLogInfo() (lastLogIndex, lastLogTerm int) {
 	return 0, 0
 }
 
-func (rf *Raft) heartbeatTicker(thisHeartbeatTerm int) {
+// leader do heartbeat
+func (rf *Raft) heartbeatTicker(savedHeartbeatTerm int) {
 	for !rf.killed() {
 
 		rf.mu.RLock()
 
-		if rf.currentTerm != thisHeartbeatTerm {
-			rf.DPritf(dTimer, "newer term detected heartbeat ticker term_%d abort\n", thisHeartbeatTerm)
+		if rf.currentTerm != savedHeartbeatTerm {
+			rf.DPritf(dTimer, "newer term detected heartbeat ticker term_%d abort\n", savedHeartbeatTerm)
 			rf.mu.RUnlock()
 			return
 		}
 
 		if rf.status != LEADER {
-			rf.DPritf(dTimer, "no longer a leader, heartbeat ticker term_%d abort\n", thisHeartbeatTerm)
+			rf.DPritf(dTimer, "no longer a leader, heartbeat ticker term_%d abort\n", savedHeartbeatTerm)
 			rf.mu.RUnlock()
 			return
 		} else {
@@ -795,30 +831,30 @@ func (rf *Raft) heartbeatTicker(thisHeartbeatTerm int) {
 
 // a elction would launch this goroutine once
 // multiple electionTickers may run at the same time
-// for a whild
+// for a while
 // but the older ones with older election term would
 // return once they found out they are no longer needed
-func (rf *Raft) electionTicker(thisElectionTerm int) {
+func (rf *Raft) electionTicker(savedElectionTerm int) {
 
 	for !rf.killed() {
 
 		// Your code here (2A)
 		// Check if a leader election should be started.
 
-		time.Sleep(20 * time.Millisecond)
-		rf.mu.RLock()
+		time.Sleep(30 * time.Millisecond)
+		rf.mu.Lock()
 
 		// this election ticker is no longer needed
-		if rf.currentTerm != thisElectionTerm {
-			rf.DPritf(dTimer, "newer term detected election ticker term_%d abort\n", thisElectionTerm)
-			rf.mu.RUnlock()
+		if rf.currentTerm != savedElectionTerm {
+			rf.DPritf(dTimer, "newer term detected election ticker term_%d abort\n", savedElectionTerm)
+			rf.mu.Unlock()
 			return
 		}
 
 		// the leader would not start election
 		if rf.status == LEADER {
-			rf.DPritf(dTimer, "already a leader, election ticker term_%d abort\n", thisElectionTerm)
-			rf.mu.RUnlock()
+			rf.DPritf(dTimer, "already a leader, election ticker term_%d abort\n", savedElectionTerm)
+			rf.mu.Unlock()
 			return
 		}
 
@@ -826,13 +862,12 @@ func (rf *Raft) electionTicker(thisElectionTerm int) {
 		if time.Now().After(rf.electionTime) {
 			rf.DPritf(dTimer, "election timeout, prepare to election\n")
 
-			rf.mu.RUnlock()
-
-			rf.mu.Lock()
 			rf.setCandidate()
 			rf.resetElectionTime()
-			rf.startElection(rf.currentTerm)
 			rf.persist()
+
+			rf.DPritf(dVote, "begin election\n")
+			go rf.doElection(rf.currentTerm)
 
 			// begin a election timer of the new term
 			go rf.electionTicker(rf.currentTerm)
@@ -840,7 +875,7 @@ func (rf *Raft) electionTicker(thisElectionTerm int) {
 			rf.mu.Unlock()
 			return
 		}
-		rf.mu.RUnlock()
+		rf.mu.Unlock()
 	}
 }
 
@@ -875,24 +910,24 @@ func (rf *Raft) DPritf(topic logTopic, format string, a ...interface{}) {
 // tester or service expects Raft to send ApplyMsg messages.
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
-
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{}
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	rf.peers = peers
-	rf.persister = persister
-	rf.me = me
-	rf.applyChan = applyCh
-	rf.commitIndex = 0
-	rf.lastApplied = 0
-	rf.nextIndex = make([]int, len(peers))
-	rf.matchIndex = make([]int, len(peers))
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.setFollower(0, NO_VOTE)
+	rf := &Raft{
+		peers:       peers,
+		persister:   persister,
+		me:          me,
+		currentTerm: 0,
+		votedFor:    NO_VOTE,
+		log:         make([]LogEntry, 0),
+		commitIndex: 0,
+		lastApplied: 0,
+		status:      FOLLOWER,
+		applyChan:   applyCh,
+		nextIndex:   make([]int, len(peers)),
+		matchIndex:  make([]int, len(peers)),
+	}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
