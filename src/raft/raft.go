@@ -55,10 +55,11 @@ type ApplyMsg struct {
 }
 
 const (
-	FOLLOWER           = byte(0)
-	CANDIDATE          = byte(1)
-	LEADER             = byte(2)
-	HEARTHEAT_INTERVAL = 100 * time.Millisecond
+	FOLLOWER  = byte(0)
+	CANDIDATE = byte(1)
+	LEADER    = byte(2)
+	// HEARTHEAT_INTERVAL = 100 * time.Millisecond
+	HEARTHEAT_INTERVAL = 70 * time.Millisecond
 	NO_VOTE            = -1
 )
 
@@ -161,7 +162,8 @@ func (rf *Raft) persist() {
 	rf.persister.Save(w.Bytes(), nil)
 
 	elapsed := time.Since(start)
-	rf.DPritf(dPersist, "write persist success, takes (%dms), currentTerm: %d, votedFor:%d, lastLogIndex: %d\n", elapsed.Milliseconds(), rf.currentTerm, rf.votedFor, len(rf.log))
+	lastLogIndex, lastLogTerm := rf.lastLogInfo()
+	rf.DPritf(dPersist, "write persist success, takes (%dms), currentTerm: %d, votedFor:%d, lastLogTerm: %d, lastLogIndex: %d\n", elapsed.Milliseconds(), rf.currentTerm, rf.votedFor, lastLogTerm, lastLogIndex)
 }
 
 type persistStates struct {
@@ -353,8 +355,21 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
+	// follower's term for leader to update itself
+	Term int
+
+	// logs in this AE have been replicated to follower or not
+	// true if args.Entries is empty
 	Sussess bool
+
+	// term in the conflicting entry
+	XTerm int
+
+	// index of first entry with that term
+	XIndex int
+
+	// length of follower's log
+	XLen int
 }
 
 // append entries and heartbeat RPC
@@ -372,6 +387,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Term = rf.currentTerm
 	reply.Sussess = false
+	reply.XTerm = 0
+	reply.XIndex = 0
+	reply.XLen = len(rf.log)
 
 	doPersist := false
 
@@ -409,10 +427,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Sussess = true
 	} else {
 		// leader have some logs before
-		for i, entry := range rf.log {
-			if i+1 == args.PrevLogIndex && entry.Term == args.PrevLogTerm {
-				matchIdx = i + 1
+		// look for the match log from back to front
+		for entryIndex := len(rf.log); entryIndex > 0; entryIndex-- {
+			entryTerm := rf.log[entryIndex-1].Term
+			if entryTerm == args.PrevLogTerm && entryIndex == args.PrevLogIndex {
+				matchIdx = entryIndex
 				reply.Sussess = true
+				break
+			}
+
+			if entryTerm < args.PrevLogTerm ||
+				(entryTerm == args.PrevLogTerm && entryIndex < args.PrevLogIndex) {
+				reply.XTerm = entryTerm
+				reply.XIndex = entryIndex
 				break
 			}
 		}
@@ -442,6 +469,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				}
 			}
 		}
+	} else {
+		rf.DPritf(dLog2, "leader prevLog mismatch, try XTerm: %d, XIndex: %d\n", reply.XTerm, reply.XIndex)
 	}
 
 	if doPersist {
@@ -521,7 +550,7 @@ func (rf *Raft) doHeartbeat() {
 
 			ni := rf.nextIndex[i]
 			prevLogIndex := ni - 1
-			prevLogTerm := -1
+			prevLogTerm := 0
 			if prevLogIndex > 0 {
 				prevLogTerm = rf.log[prevLogIndex-1].Term
 			}
@@ -605,8 +634,36 @@ func (rf *Raft) doHeartbeat() {
 						// in its log entries
 						// decrement the nextIndex to this server
 						// and wait for next AE try
-						rf.nextIndex[server]--
-						rf.DPritf(dLog, "prevLogIndex not match, decrement nextIndex for [%d]\n", server)
+
+						// TODO: faster match
+						// rf.nextIndex[server]--
+						// rf.DPritf(dLog, "prevLogIndex not match, decrement nextIndex for [%d]\n", server)
+
+						// if follower's log is empty
+						// or have useless higher term logs
+						if reply.XTerm == 0 {
+							rf.nextIndex[server] = 1
+						}
+
+						// if the follower have logs in this term
+						// but no lastLogIndex
+						if reply.XTerm == prevLogTerm {
+							rf.nextIndex[server] = reply.XIndex + 1
+						} else {
+							// if the follower have no logs in prevLogTerm
+							// but have logs before prevLogTerm
+							// try the last log of follower reply conflicting term
+							i := rf.nextIndex[server] - 1
+							rf.nextIndex[server] = 1
+							for ; i > 0; i-- {
+								if rf.log[i-1].Term <= reply.XTerm {
+									rf.nextIndex[server] = i + 1
+									break
+								}
+							}
+						}
+
+						rf.DPritf(dLog2, "prevLog mismatch, try nextIndex: %d\n", rf.nextIndex[server])
 					}
 				}
 				// } else {
