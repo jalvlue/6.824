@@ -837,7 +837,9 @@ func TestFigure82C(t *testing.T) {
 
 	cfg.begin("Test (2C): Figure 8")
 
+	log.Printf("#Test (2C): request a command")
 	cfg.one(rand.Int(), 1, true)
+	log.Printf("#Test (2C): request a command done")
 
 	nup := servers
 	for iters := 0; iters < 1000; iters++ {
@@ -847,16 +849,21 @@ func TestFigure82C(t *testing.T) {
 				_, _, ok := cfg.rafts[i].Start(rand.Int())
 				if ok {
 					leader = i
+					log.Printf("#Test (2C): request a command on leader[%d]", leader)
 				}
 			}
 		}
 
 		if (rand.Int() % 1000) < 100 {
+			// 0 < ms < 500
 			ms := rand.Int63() % (int64(RaftElectionTimeout/time.Millisecond) / 2)
+			log.Printf("#Test (2C): sleep (%dms) wait for leader", ms)
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 		} else {
+			// 0 < ms < 13
 			ms := (rand.Int63() % 13)
 			time.Sleep(time.Duration(ms) * time.Millisecond)
+			log.Printf("#Test (2C): sleep (%dms) wait for leader", ms)
 		}
 
 		if leader != -1 {

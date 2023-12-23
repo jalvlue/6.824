@@ -96,6 +96,8 @@ type Raft struct {
 	// for each server, index of highest log entry
 	// known to be replicated on server
 	matchIndex []int
+
+	heartbeatTime time.Time
 }
 
 type LogEntry struct {
@@ -512,6 +514,9 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 	rf.DPritf(dClient, "new log append to leader [%d], newLogTerm: %d, newLogIndex: %d\n", rf.me, term, len(rf.log))
 	rf.persist()
 
+	rf.doHeartbeat()
+	rf.resetHeartbeatTime()
+
 	// Your code here (2B).
 
 	return
@@ -635,7 +640,7 @@ func (rf *Raft) doHeartbeat() {
 						// decrement the nextIndex to this server
 						// and wait for next AE try
 
-						// TODO: faster match
+						// finish faster match with XTerm & XIndex
 						// rf.nextIndex[server]--
 						// rf.DPritf(dLog, "prevLogIndex not match, decrement nextIndex for [%d]\n", server)
 
@@ -877,11 +882,16 @@ func (rf *Raft) heartbeatTicker(savedHeartbeatTerm int) {
 			rf.DPritf(dTimer, "no longer a leader, heartbeat ticker term_%d abort\n", savedHeartbeatTerm)
 			rf.mu.RUnlock()
 			return
-		} else {
-			rf.doHeartbeat()
-			rf.mu.RUnlock()
 		}
 
+		// HEARTBEAT_INTERVAL passes after last heartbeat
+		// which may or may no be trigger by rf.Start()
+		if time.Now().After(rf.heartbeatTime) {
+			rf.doHeartbeat()
+			rf.resetHeartbeatTime()
+		}
+
+		rf.mu.RUnlock()
 		time.Sleep(HEARTHEAT_INTERVAL)
 	}
 }
@@ -934,6 +944,12 @@ func (rf *Raft) electionTicker(savedElectionTerm int) {
 		}
 		rf.mu.Unlock()
 	}
+}
+
+// reset next heartbeat time
+// expect the caller to hold the lock
+func (rf *Raft) resetHeartbeatTime() {
+	rf.heartbeatTime = time.Now().Add(HEARTHEAT_INTERVAL)
 }
 
 // expect the caller to hold the lock
