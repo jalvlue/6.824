@@ -541,6 +541,140 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+// expect the caller to hold the lock
+// generate and return a AppendEntriesArg for a specify server
+func (rf *Raft) generateAEargs(server int) *AppendEntriesArgs {
+	ni := rf.nextIndex[server]
+	prevLogIndex := ni - 1
+	prevLogTerm := 0
+	if prevLogIndex > 0 {
+		prevLogTerm = rf.log[prevLogIndex-1].Term
+	}
+	entries := make([]LogEntry, len(rf.log)-prevLogIndex)
+	copy(entries, rf.log[prevLogIndex:])
+
+	if len(entries) == 0 {
+		rf.DPritf(dLog, "send heartbeat RPC to [%d]\n", server)
+	} else {
+		rf.DPritf(dLog, "send AppendEntries RPC {%d->%d} RPC to [%d]\n", ni, ni+len(entries)-1, server)
+	}
+
+	return &AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderID:     rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      entries,
+		LeaderCommit: rf.commitIndex,
+	}
+}
+
+// TODO: make function that send RPC to one follower a named method
+// so that once a follower return reply.Success = false, we could
+// resend a RPC with new nextIndex immediately
+// TODO: use a fancy name
+func (rf *Raft) sendAEtoPeer(server int, args *AppendEntriesArgs) {
+	logLength := len(args.Entries)
+	reply := &AppendEntriesReply{}
+	ok := rf.sendAppendEntries(server, args, reply)
+
+	if ok {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+
+		rf.DPritf(dTimer, "receive heartbeat RPC reply from [%d], {%v}\n", server, reply)
+
+		if reply.Term > rf.currentTerm {
+			rf.setFollower(reply.Term, NO_VOTE)
+			rf.resetElectionTime()
+			go rf.electionTicker(rf.currentTerm)
+
+			rf.DPritf(dTimer, "lagging behind other peers, heartbeat abort, convert to follower\n")
+			rf.DPritf(dTimer, "election ticker begin (%dms)\n", rf.electionTimeout.Milliseconds())
+
+			rf.persist()
+			return
+		}
+
+		if rf.status != LEADER {
+			rf.DPritf(dLog, "no longer a leader, discard reply")
+			return
+		}
+
+		rf.DPritf(dLog, "heartbeatRPC to [%d] success\n", server)
+
+		if reply.Sussess {
+			if logLength != 0 {
+				ni := args.PrevLogIndex + 1
+				rf.matchIndex[server] = ni + logLength - 1
+				rf.nextIndex[server] = ni + logLength
+				rf.DPritf(dLeader, "log entries {%d->%d} replicated to [%d] success\n", ni, rf.matchIndex[server], server)
+				rf.DPritf(dLeader, "for follower[%d], matchIndex: %d, nextIndex: %d\n", server, rf.matchIndex[server], rf.nextIndex[server])
+			}
+
+			rf.DPritf(dLeader, "check if have some entries to commit, leaderCommitIndex: {%d}, leaderLastIndex: {%d}\n", rf.commitIndex, len(rf.log))
+			for index := rf.commitIndex + 1; index < len(rf.log)+1; index++ {
+				matchCount := 0
+				for j := range rf.peers {
+					if index <= rf.matchIndex[j] {
+						matchCount++
+					}
+					if matchCount*2 > len(rf.peers) {
+						rf.commitIndex = index
+						rf.DPritf(dCommit, "leader commitIndex {%d}\n", index)
+						rf.applyChan <- ApplyMsg{
+							CommandValid: true,
+							CommandIndex: index,
+							Command:      rf.log[index-1].Command,
+						}
+					}
+				}
+			}
+		} else {
+			// heartbeat success, but AE fail
+			// the follower have not prevLogIndex & prevLogTerm
+			// in its log entries
+			// decrement the nextIndex to this server
+			// and wait for next AE try
+
+			// finish faster match with XTerm & XIndex
+			// rf.nextIndex[server]--
+			// rf.DPritf(dLog, "prevLogIndex not match, decrement nextIndex for [%d]\n", server)
+
+			// if follower's log is empty
+			// or have useless higher term logs
+			if reply.XTerm == 0 {
+				rf.nextIndex[server] = 1
+			}
+
+			// if the follower have logs in this term
+			// but no lastLogIndex
+			if reply.XTerm == args.PrevLogTerm {
+				rf.nextIndex[server] = reply.XIndex + 1
+			} else {
+				// if the follower have no logs in prevLogTerm
+				// but have logs before prevLogTerm
+				// try the last log of follower reply conflicting term
+				i := rf.nextIndex[server] - 1
+				rf.nextIndex[server] = 1
+				for ; i > 0; i-- {
+					if rf.log[i-1].Term <= reply.XTerm {
+						rf.nextIndex[server] = i + 1
+						break
+					}
+				}
+			}
+
+			rf.DPritf(dLog2, "prevLog mismatch, try nextIndex: %d\n", rf.nextIndex[server])
+
+			// resent a rpc with nextIndex decrease to this follower
+			// immediately, instead of wait for HEARTBEAT_INTERVAL
+			newArgs := rf.generateAEargs(server)
+			go rf.sendAEtoPeer(server, newArgs)
+		}
+	}
+}
+
 // expect the caller to hold the read lock
 // launch a bunch of goroutines to
 // send heartbeat/appendEntries RPCs to all other peers
@@ -552,131 +686,8 @@ func (rf *Raft) doHeartbeat() {
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			// send heartbeat RPCs to all other peers
-
-			ni := rf.nextIndex[i]
-			prevLogIndex := ni - 1
-			prevLogTerm := 0
-			if prevLogIndex > 0 {
-				prevLogTerm = rf.log[prevLogIndex-1].Term
-			}
-			entries := make([]LogEntry, len(rf.log)-prevLogIndex)
-			copy(entries, rf.log[prevLogIndex:])
-
-			args := &AppendEntriesArgs{
-				Term:         rf.currentTerm,
-				LeaderID:     rf.me,
-				PrevLogIndex: prevLogIndex,
-				PrevLogTerm:  prevLogTerm,
-				Entries:      entries,
-				LeaderCommit: rf.commitIndex,
-			}
-
-			if len(entries) == 0 {
-				rf.DPritf(dLog, "send heartbeat RPC to [%d]\n", i)
-			} else {
-				rf.DPritf(dLog, "send AppendEntries RPC {%d->%d} RPC to [%d]\n", ni, ni+len(entries)-1, i)
-			}
-
-			go func(server int) {
-				reply := &AppendEntriesReply{}
-				ok := rf.sendAppendEntries(server, args, reply)
-
-				if ok {
-					rf.mu.Lock()
-					defer rf.mu.Unlock()
-
-					rf.DPritf(dTimer, "receive heartbeat RPC reply from [%d], {%v}\n", server, reply)
-
-					if reply.Term > rf.currentTerm {
-						rf.setFollower(reply.Term, NO_VOTE)
-						rf.resetElectionTime()
-						go rf.electionTicker(rf.currentTerm)
-
-						rf.DPritf(dTimer, "lagging behind other peers, heartbeat abort, convert to follower\n")
-						rf.DPritf(dTimer, "election ticker begin (%dms)\n", rf.electionTimeout.Milliseconds())
-
-						rf.persist()
-						return
-					}
-
-					if rf.status != LEADER {
-						rf.DPritf(dLog, "no longer a leader, discard reply")
-						return
-					}
-
-					rf.DPritf(dLog, "heartbeatRPC to [%d] success\n", server)
-
-					// replicated success
-					if reply.Sussess {
-						if len(entries) != 0 {
-							rf.matchIndex[server] = ni + len(entries) - 1
-							rf.nextIndex[server] = ni + len(entries)
-							rf.DPritf(dLeader, "log entries {%d->%d} replicated to [%d] success\n", ni, ni+len(entries)-1, server)
-							rf.DPritf(dLeader, "for follower[%d], matchIndex: %d, nextIndex: %d", server, rf.matchIndex[server], rf.nextIndex[server])
-
-							rf.DPritf(dLeader, "check if have some entries to commit, leaderCommitIndex: {%d}, leaderLastIndex: {%d}", rf.commitIndex, len(rf.log))
-							for index := rf.commitIndex + 1; index < len(rf.log)+1; index++ {
-								matchCount := 0
-								for j := range rf.peers {
-									if index <= rf.matchIndex[j] {
-										matchCount++
-									}
-									if matchCount*2 > len(rf.peers) {
-										rf.commitIndex = index
-										rf.DPritf(dCommit, "leader commitIndex {%d}", index)
-										rf.applyChan <- ApplyMsg{
-											CommandValid: true,
-											CommandIndex: index,
-											Command:      rf.log[index-1].Command,
-										}
-									}
-								}
-							}
-						}
-					} else {
-						// heartbeat success, but AE fail
-						// the follower have not prevLogIndex & prevLogTerm
-						// in its log entries
-						// decrement the nextIndex to this server
-						// and wait for next AE try
-
-						// finish faster match with XTerm & XIndex
-						// rf.nextIndex[server]--
-						// rf.DPritf(dLog, "prevLogIndex not match, decrement nextIndex for [%d]\n", server)
-
-						// if follower's log is empty
-						// or have useless higher term logs
-						if reply.XTerm == 0 {
-							rf.nextIndex[server] = 1
-						}
-
-						// if the follower have logs in this term
-						// but no lastLogIndex
-						if reply.XTerm == prevLogTerm {
-							rf.nextIndex[server] = reply.XIndex + 1
-						} else {
-							// if the follower have no logs in prevLogTerm
-							// but have logs before prevLogTerm
-							// try the last log of follower reply conflicting term
-							i := rf.nextIndex[server] - 1
-							rf.nextIndex[server] = 1
-							for ; i > 0; i-- {
-								if rf.log[i-1].Term <= reply.XTerm {
-									rf.nextIndex[server] = i + 1
-									break
-								}
-							}
-						}
-
-						rf.DPritf(dLog2, "prevLog mismatch, try nextIndex: %d\n", rf.nextIndex[server])
-					}
-				}
-				// } else {
-				// rf.DPritf(dTimer, "heartbeat RPC to [%d] failed", server)
-				// this would take 1600+ms
-				// just simply ignore it
-				// return
-			}(i)
+			args := rf.generateAEargs(i)
+			go rf.sendAEtoPeer(i, args)
 		}
 	}
 
@@ -823,6 +834,14 @@ func (rf *Raft) setCandidate() {
 // expect the caller to hold the lock
 func (rf *Raft) setLeader() {
 	rf.status = LEADER
+	rf.heartbeatTime = time.Now()
+
+	if rf.nextIndex == nil {
+		rf.nextIndex = make([]int, len(rf.peers))
+	}
+	if rf.matchIndex == nil {
+		rf.matchIndex = make([]int, len(rf.peers))
+	}
 
 	// set next log entry index sending to peers to
 	// leader's last log index+1
@@ -870,29 +889,27 @@ func (rf *Raft) lastLogInfo() (lastLogIndex, lastLogTerm int) {
 func (rf *Raft) heartbeatTicker(savedHeartbeatTerm int) {
 	for !rf.killed() {
 
-		rf.mu.RLock()
+		rf.mu.Lock()
 
 		if rf.currentTerm != savedHeartbeatTerm {
 			rf.DPritf(dTimer, "newer term detected heartbeat ticker term_%d abort\n", savedHeartbeatTerm)
-			rf.mu.RUnlock()
+			rf.mu.Unlock()
 			return
 		}
 
 		if rf.status != LEADER {
 			rf.DPritf(dTimer, "no longer a leader, heartbeat ticker term_%d abort\n", savedHeartbeatTerm)
-			rf.mu.RUnlock()
+			rf.mu.Unlock()
 			return
 		}
 
-		// HEARTBEAT_INTERVAL passes after last heartbeat
-		// which may or may no be trigger by rf.Start()
 		if time.Now().After(rf.heartbeatTime) {
 			rf.doHeartbeat()
 			rf.resetHeartbeatTime()
 		}
 
-		rf.mu.RUnlock()
-		time.Sleep(HEARTHEAT_INTERVAL)
+		rf.mu.Unlock()
+		time.Sleep(30 * time.Millisecond)
 	}
 }
 
@@ -998,8 +1015,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		lastApplied: 0,
 		status:      FOLLOWER,
 		applyChan:   applyCh,
-		nextIndex:   make([]int, len(peers)),
-		matchIndex:  make([]int, len(peers)),
 	}
 
 	// initialize from state persisted before a crash

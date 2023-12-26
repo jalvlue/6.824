@@ -844,6 +844,7 @@ func TestFigure82C(t *testing.T) {
 	nup := servers
 	for iters := 0; iters < 1000; iters++ {
 		leader := -1
+		// request a command on leader
 		for i := 0; i < servers; i++ {
 			if cfg.rafts[i] != nil {
 				_, _, ok := cfg.rafts[i].Start(rand.Int())
@@ -854,6 +855,9 @@ func TestFigure82C(t *testing.T) {
 			}
 		}
 
+		// sleep for a while
+		// with a high possibility of no commit the requested command
+		// with a low possibility of commiting the requested command
 		if (rand.Int() % 1000) < 100 {
 			// 0 < ms < 500
 			ms := rand.Int63() % (int64(RaftElectionTimeout/time.Millisecond) / 2)
@@ -934,32 +938,39 @@ func TestFigure8Unreliable2C(t *testing.T) {
 
 	cfg.begin("Test (2C): Figure 8 (unreliable)")
 
+	log.Printf("#Test (2C): request a command")
 	cfg.one(rand.Int()%10000, 1, true)
+	log.Printf("#Test (2C): request a command done")
 
 	nup := servers
 	for iters := 0; iters < 1000; iters++ {
 		if iters == 200 {
 			cfg.setlongreordering(true)
+			log.Printf("#Test (2C): set long reordering")
 		}
 		leader := -1
 		for i := 0; i < servers; i++ {
 			_, _, ok := cfg.rafts[i].Start(rand.Int() % 10000)
 			if ok && cfg.connected[i] {
 				leader = i
+				log.Printf("#Test (2C): request a command on leader[%d]", leader)
 			}
 		}
 
 		if (rand.Int() % 1000) < 100 {
 			ms := rand.Int63() % (int64(RaftElectionTimeout/time.Millisecond) / 2)
+			log.Printf("#Test (2C): sleep (%dms) wait for leader", ms)
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 		} else {
 			ms := (rand.Int63() % 13)
+			log.Printf("#Test (2C): sleep (%dms) wait for leader", ms)
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 		}
 
 		if leader != -1 && (rand.Int()%1000) < int(RaftElectionTimeout/time.Millisecond)/2 {
 			cfg.disconnect(leader)
 			nup -= 1
+			log.Printf("#Test (2C): crash leader [%d]\n", leader)
 		}
 
 		if nup < 3 {
@@ -967,6 +978,7 @@ func TestFigure8Unreliable2C(t *testing.T) {
 			if cfg.connected[s] == false {
 				cfg.connect(s)
 				nup += 1
+				log.Printf("#Test (2C): start server [%d]\n", s)
 			}
 		}
 	}
@@ -974,8 +986,11 @@ func TestFigure8Unreliable2C(t *testing.T) {
 	for i := 0; i < servers; i++ {
 		if cfg.connected[i] == false {
 			cfg.connect(i)
+			log.Printf("#Test (2C): start server [%d]\n", i)
 		}
 	}
+
+	log.Println("#Test (2C): start all servers and request a command")
 
 	cfg.one(rand.Int()%10000, servers, true)
 
