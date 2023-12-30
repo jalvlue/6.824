@@ -97,7 +97,9 @@ type Raft struct {
 	// known to be replicated on server
 	matchIndex []int
 
-	heartbeatTime time.Time
+	heartbeatTime    time.Time
+	heartbeatOnGoing []bool
+	triggerAE        bool
 }
 
 type LogEntry struct {
@@ -270,6 +272,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	doPersist := false
+	defer func() {
+		if doPersist {
+			rf.persist()
+		}
+	}()
 
 	// in a lower term
 	// convert to a follower of this term
@@ -279,6 +286,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.setFollower(args.Term, NO_VOTE)
 		doPersist = true
 		reply.Status = FOLLOWER
+		rf.resetElectionTime()
 		go rf.electionTicker(rf.currentTerm)
 		rf.DPritf(dVote, "election ticker begin(%dms)\n", rf.electionTimeout.Milliseconds())
 	}
@@ -286,19 +294,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	lastIndex, lastTerm := rf.lastLogInfo()
 
 	// vote granted if no vote and have out-of-date logs
-	if rf.votedFor == NO_VOTE &&
+	if (rf.votedFor == NO_VOTE || rf.votedFor == args.CandidateID) &&
 		(args.LastLogTerm > lastTerm ||
 			(args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIndex)) {
 		rf.DPritf(dVote, "vote granted to [%d]\n", args.CandidateID)
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateID
 		doPersist = true
+		rf.resetElectionTime()
 	} else {
 		rf.DPritf(dVote, "no vote granted to candidate [%d]", args.CandidateID)
-	}
-
-	if doPersist {
-		rf.persist()
 	}
 }
 
@@ -378,13 +383,20 @@ type AppendEntriesReply struct {
 // for lab 2A only heartbeat is implemented
 // for lab 2B log replication is implemented
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+
+	argsEntriesLen := len(args.Entries)
+	var argsLastTerm int
+	var argsLastIndex int
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if len(args.Entries) == 0 {
+	if argsEntriesLen == 0 {
 		rf.DPritf(dLog, "receive heartbeat RPC from [%d]\n", args.LeaderID)
 	} else {
 		rf.DPritf(dLog, "receive AppendEntries RPC from [%d]\n", args.LeaderID)
+		argsLastTerm = args.Entries[argsEntriesLen-1].Term
+		argsLastIndex = args.PrevLogIndex + argsEntriesLen
 	}
 
 	reply.Term = rf.currentTerm
@@ -426,7 +438,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// check if log match with this prevLog
-	matchIdx := -1
+	var matchIdx int
 	// leader initialize
 	if args.PrevLogIndex == 0 {
 		matchIdx = 0
@@ -436,6 +448,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// look for the match log from back to front
 		for entryIndex := len(rf.log); entryIndex > 0; entryIndex-- {
 			entryTerm := rf.log[entryIndex-1].Term
+
+			if entryTerm == argsLastTerm && entryIndex == argsLastIndex {
+				matchIdx = -1
+				reply.Sussess = true
+				break
+			}
+
 			if entryTerm == args.PrevLogTerm && entryIndex == args.PrevLogIndex {
 				matchIdx = entryIndex
 				reply.Sussess = true
@@ -453,15 +472,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if reply.Sussess {
 		// heartbeat with log entries
-		if len(args.Entries) != 0 {
-			// discard mismatched logs
-			rf.log = rf.log[:matchIdx]
-			// append leader's log
-			rf.log = append(rf.log, args.Entries...)
+		if matchIdx == -1 {
+			rf.DPritf(dLog, "newer log replicated! do not overwrite\n")
+		} else {
+			if argsEntriesLen != 0 {
+				// discard mismatched logs
+				rf.log = rf.log[:matchIdx]
+				// append leader's log
+				rf.log = append(rf.log, args.Entries...)
 
-			followerLastIndex, followerLastTerm := rf.lastLogInfo()
-			rf.DPritf(dLog, "log replicated, matchTerm: %d, matchIndex: %d, lastLogTerm: %d, lastLogIndex: %d", args.PrevLogTerm, matchIdx, followerLastTerm, followerLastIndex)
-			doPersist = true
+				followerLastIndex, followerLastTerm := rf.lastLogInfo()
+				rf.DPritf(dLog, "log replicated, matchTerm: %d, matchIndex: %d, lastLogTerm: %d, lastLogIndex: %d", args.PrevLogTerm, matchIdx, followerLastTerm, followerLastIndex)
+				doPersist = true
+			}
 		}
 
 		if args.LeaderCommit > rf.commitIndex {
@@ -514,8 +537,7 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 	rf.DPritf(dClient, "new log append to leader [%d], newLogTerm: %d, newLogIndex: %d\n", rf.me, term, len(rf.log))
 	rf.persist()
 
-	rf.doHeartbeat(true)
-	rf.resetHeartbeatTime()
+	rf.triggerAE = true
 
 	// Your code here (2B).
 
@@ -543,7 +565,7 @@ func (rf *Raft) killed() bool {
 
 // expect the caller to hold the lock
 // generate and return a AppendEntriesArg for a specify server
-func (rf *Raft) generateAEargs(server int) *AppendEntriesArgs {
+func (rf *Raft) generateAEargs(server int) (*AppendEntriesArgs, bool) {
 	ni := rf.nextIndex[server]
 	prevLogIndex := ni - 1
 	prevLogTerm := 0
@@ -553,9 +575,12 @@ func (rf *Raft) generateAEargs(server int) *AppendEntriesArgs {
 	entries := make([]LogEntry, len(rf.log)-prevLogIndex)
 	copy(entries, rf.log[prevLogIndex:])
 
+	var couldCommit bool
 	if len(entries) == 0 {
+		couldCommit = false
 		rf.DPritf(dLog, "send heartbeat RPC to [%d]\n", server)
 	} else {
+		couldCommit = entries[len(entries)-1].Term == rf.currentTerm
 		rf.DPritf(dLog, "send AppendEntries RPC {%d->%d} RPC to [%d]\n", ni, ni+len(entries)-1, server)
 	}
 
@@ -566,13 +591,12 @@ func (rf *Raft) generateAEargs(server int) *AppendEntriesArgs {
 		PrevLogTerm:  prevLogTerm,
 		Entries:      entries,
 		LeaderCommit: rf.commitIndex,
-	}
+	}, couldCommit
 }
 
-// TODO: make function that send RPC to one follower a named method
+// make function that send RPC to one follower a named method
 // so that once a follower return reply.Success = false, we could
 // resend a RPC with new nextIndex immediately
-// TODO: use a fancy name
 func (rf *Raft) sendAEtoPeer(couldCommit bool, server int, args *AppendEntriesArgs) {
 	logLength := len(args.Entries)
 	reply := &AppendEntriesReply{}
@@ -581,6 +605,8 @@ func (rf *Raft) sendAEtoPeer(couldCommit bool, server int, args *AppendEntriesAr
 	if ok {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
+
+		rf.heartbeatOnGoing[server] = false
 
 		rf.DPritf(dTimer, "receive heartbeat RPC reply from [%d], {%v}\n", server, reply)
 
@@ -614,20 +640,32 @@ func (rf *Raft) sendAEtoPeer(couldCommit bool, server int, args *AppendEntriesAr
 
 			if couldCommit {
 				rf.DPritf(dLeader, "check if have some entries to commit, leaderCommitIndex: {%d}, leaderLastIndex: {%d}\n", rf.commitIndex, len(rf.log))
-				for index := rf.commitIndex + 1; index < len(rf.log)+1; index++ {
-					matchCount := 0
-					for j := range rf.peers {
-						if index <= rf.matchIndex[j] {
-							matchCount++
-						}
-						if matchCount*2 > len(rf.peers) {
-							rf.commitIndex = index
-							rf.DPritf(dCommit, "leader commitIndex {%d}\n", index)
-							rf.applyChan <- ApplyMsg{
-								CommandValid: true,
-								CommandIndex: index,
-								Command:      rf.log[index-1].Command,
+
+				doApply := false
+				savedCommitIndex := rf.commitIndex
+				if savedCommitIndex < args.PrevLogIndex+logLength {
+					for index := args.PrevLogIndex + logLength; index <= len(rf.log); index++ {
+						matchCount := 0
+						for j := range rf.peers {
+							if index <= rf.matchIndex[j] {
+								matchCount++
 							}
+							if matchCount*2 > len(rf.peers) {
+								rf.commitIndex = index
+								rf.DPritf(dCommit, "leader commitIndex {%d}\n", index)
+								doApply = true
+								break
+							}
+						}
+					}
+				}
+
+				if doApply {
+					for index := savedCommitIndex + 1; index <= rf.commitIndex; index++ {
+						rf.applyChan <- ApplyMsg{
+							CommandValid: true,
+							CommandIndex: index,
+							Command:      rf.log[index-1].Command,
 						}
 					}
 				}
@@ -671,8 +709,9 @@ func (rf *Raft) sendAEtoPeer(couldCommit bool, server int, args *AppendEntriesAr
 
 			// resent a rpc with nextIndex decrease to this follower
 			// immediately, instead of wait for HEARTBEAT_INTERVAL
-			newArgs := rf.generateAEargs(server)
-			go rf.sendAEtoPeer(couldCommit, server, newArgs)
+			newArgs, newCouldCommit := rf.generateAEargs(server)
+			go rf.sendAEtoPeer(newCouldCommit, server, newArgs)
+			rf.heartbeatOnGoing[server] = true
 		}
 	}
 }
@@ -681,14 +720,15 @@ func (rf *Raft) sendAEtoPeer(couldCommit bool, server int, args *AppendEntriesAr
 // launch a bunch of goroutines to
 // send heartbeat/appendEntries RPCs to all other peers
 // and return immediately
-func (rf *Raft) doHeartbeat(couldCommit bool) {
+func (rf *Raft) doHeartbeat() {
 	rf.DPritf(dLog, "bgein sending heartbeat RPCs to followers\n")
 
 	// start := time.Now()
 	for i := 0; i < len(rf.peers); i++ {
-		if i != rf.me {
+		if i != rf.me && !rf.heartbeatOnGoing[i] {
 			// send heartbeat RPCs to all other peers
-			args := rf.generateAEargs(i)
+			rf.heartbeatOnGoing[i] = true
+			args, couldCommit := rf.generateAEargs(i)
 			go rf.sendAEtoPeer(couldCommit, i, args)
 		}
 	}
@@ -702,7 +742,8 @@ func (rf *Raft) doHeartbeat(couldCommit bool) {
 // send and re-send RV RPCs to all peers in this election timeout
 func (rf *Raft) doElection(savedCandidateTerm int) {
 
-	voteReceived := 1
+	voteReceived := make([]bool, len(rf.peers))
+	voteReceived[rf.me] = true
 	hasReply := make([]bool, len(rf.peers))
 	electionDone := false
 
@@ -779,10 +820,17 @@ func (rf *Raft) doElection(savedCandidateTerm int) {
 						}
 
 						if reply.VoteGranted {
-							voteReceived++
-							rf.DPritf(dVote, "vote granted from [%d], voteCount: %d/%d\n", server, voteReceived, len(rf.peers))
+							voteReceived[server] = true
 
-							if voteReceived*2 > len(rf.peers) {
+							voteCount := 0
+							for i := range voteReceived {
+								if voteReceived[i] {
+									voteCount++
+								}
+							}
+
+							rf.DPritf(dVote, "vote granted from [%d], voteCount: %d/%d\n", server, voteCount, len(rf.peers))
+							if voteCount*2 > len(rf.peers) {
 								rf.DPritf(dVote, "won election\n")
 								rf.DPritf(dTimer, "heartbeat ticker begin\n")
 
@@ -838,6 +886,9 @@ func (rf *Raft) setLeader() {
 	rf.status = LEADER
 	rf.heartbeatTime = time.Now()
 
+	if rf.heartbeatOnGoing == nil {
+		rf.heartbeatOnGoing = make([]bool, len(rf.peers))
+	}
 	if rf.nextIndex == nil {
 		rf.nextIndex = make([]int, len(rf.peers))
 	}
@@ -905,13 +956,20 @@ func (rf *Raft) heartbeatTicker(savedHeartbeatTerm int) {
 			return
 		}
 
-		if time.Now().After(rf.heartbeatTime) {
-			rf.doHeartbeat(false)
+		if rf.triggerAE {
+			rf.triggerAE = false
+			rf.doHeartbeat()
+			rf.resetHeartbeatTime()
+		} else if time.Now().After(rf.heartbeatTime) {
+			for i := range rf.heartbeatOnGoing {
+				rf.heartbeatOnGoing[i] = false
+			}
+			rf.doHeartbeat()
 			rf.resetHeartbeatTime()
 		}
 
 		rf.mu.Unlock()
-		time.Sleep(30 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
