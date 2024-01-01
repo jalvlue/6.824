@@ -251,6 +251,7 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
+// TODO: have bugs here
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
@@ -745,12 +746,13 @@ func (rf *Raft) doElection(savedCandidateTerm int) {
 	voteReceived := make([]bool, len(rf.peers))
 	voteReceived[rf.me] = true
 	hasReply := make([]bool, len(rf.peers))
+	replyCount := 1
 	electionDone := false
 
 	for !rf.killed() {
 
 		rf.mu.RLock()
-		if rf.currentTerm != savedCandidateTerm || rf.status != CANDIDATE {
+		if rf.currentTerm != savedCandidateTerm || rf.status != CANDIDATE || electionDone {
 			rf.DPritf(dDrop, "election term_%d done\n", savedCandidateTerm)
 			electionDone = true
 			rf.mu.RUnlock()
@@ -779,6 +781,7 @@ func (rf *Raft) doElection(savedCandidateTerm int) {
 						defer rf.mu.Unlock()
 
 						hasReply[server] = true
+						replyCount++
 
 						rf.DPritf(dVote, "receive RequestVote RPC reply from [%d], {%v}\n", server, reply)
 
@@ -859,6 +862,10 @@ func (rf *Raft) doElection(savedCandidateTerm int) {
 					// }
 				}(i)
 			}
+		}
+
+		if replyCount == len(rf.peers) {
+			electionDone = true
 		}
 
 		rf.mu.RUnlock()
@@ -985,7 +992,7 @@ func (rf *Raft) electionTicker(savedElectionTerm int) {
 		// Your code here (2A)
 		// Check if a leader election should be started.
 
-		time.Sleep(30 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 		rf.mu.Lock()
 
 		// this election ticker is no longer needed
@@ -1033,11 +1040,12 @@ func (rf *Raft) resetHeartbeatTime() {
 func (rf *Raft) resetElectionTime() {
 	rf.electionTimeout = randomTimeout()
 	rf.electionTime = time.Now().Add(rf.electionTimeout)
+	rf.DPritf(dTimer, "election interval set to (%dms)\n", rf.electionTimeout.Milliseconds())
 }
 
-// generate a random timeout between 300ms and 450ms
+// generate a random timeout between 300ms and 500ms
 func randomTimeout() time.Duration {
-	return time.Duration(300+rand.Intn(150)) * time.Millisecond
+	return time.Duration(300+rand.Intn(200)) * time.Millisecond
 }
 
 // expect the caller to hold the read lock
@@ -1083,7 +1091,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.resetElectionTime()
 	go rf.electionTicker(rf.currentTerm)
 	rf.DPritf(dTerm, "started\n")
-	rf.DPritf(dTimer, "election ticker begin(%dms)\n", rf.electionTimeout.Milliseconds())
 
 	return rf
 }
