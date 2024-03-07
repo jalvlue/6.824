@@ -96,6 +96,10 @@ type Raft struct {
 	// known to be replicated on server
 	matchIndex []int
 
+	// index of first client request to this leader
+	// -1 as default, with rf.firstIndex == -1,
+	// this leader would not commit logs which appended by former leaders
+	firstIndex    int
 	heartbeatTime time.Time
 	triggerAE     bool
 }
@@ -539,6 +543,9 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 	rf.persist()
 
 	rf.triggerAE = true
+	if rf.firstIndex == -1 {
+		rf.firstIndex = index
+	}
 
 	// Your code here (2B).
 
@@ -596,7 +603,7 @@ func (rf *Raft) generateAEargs(server int) *AppendEntriesArgs {
 // make function that send RPC to one follower a named method
 // so that once a follower return reply.Success = false, we could
 // resend a RPC with new nextIndex immediately
-func (rf *Raft) sendAEtoPeer(savedHeartbeatTerm int, couldCommit bool, server int, args *AppendEntriesArgs) {
+func (rf *Raft) sendAEtoPeer(server int, args *AppendEntriesArgs) {
 	reply := &AppendEntriesReply{}
 	ok := rf.sendAppendEntries(server, args, reply)
 
@@ -632,6 +639,7 @@ func (rf *Raft) sendAEtoPeer(savedHeartbeatTerm int, couldCommit bool, server in
 				newMatchIndex := newNextIndex - 1
 
 				if newMatchIndex > rf.matchIndex[server] && newNextIndex > rf.nextIndex[server] {
+					couldCommit := (rf.firstIndex != -1 && oldNextIndex >= rf.firstIndex)
 					rf.matchIndex[server] = newMatchIndex
 					rf.nextIndex[server] = newNextIndex
 					rf.DPritf(dLeader, "log entries {%d->%d} replicated to [%d] success\nfor follower[%d], newMatchIndex: %d, newNextIndex: %d\nCOULD COMMIT: %v\n", oldNextIndex, newMatchIndex, server, server, newMatchIndex, newNextIndex, couldCommit)
@@ -719,7 +727,7 @@ func (rf *Raft) sendAEtoPeer(savedHeartbeatTerm int, couldCommit bool, server in
 			// immediately, instead of waiting for HEARTBEAT_INTERVAL
 			// TODO: consider it
 			newArgs := rf.generateAEargs(server)
-			go rf.sendAEtoPeer(savedHeartbeatTerm, couldCommit, server, newArgs)
+			go rf.sendAEtoPeer(server, newArgs)
 		}
 	}
 }
@@ -730,16 +738,15 @@ func (rf *Raft) sendAEtoPeer(savedHeartbeatTerm int, couldCommit bool, server in
 // and return immediately
 // couldCommit only when triggered by Start()
 // to avoid helping commit logs belongs to former leaders
-func (rf *Raft) doHeartbeat(couldCommit bool) {
-	myCouldCommit := couldCommit
-	rf.DPritf(dLog, "begin sending heartbeat RPCs to followers, couldCommit: %v\n", myCouldCommit)
+func (rf *Raft) doHeartbeat() {
+	rf.DPritf(dLog, "begin sending heartbeat RPCs to followers\n")
 
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			// send heartbeat RPCs to all other peers
 			rf.DPritf(dLeader, "send heartbeat RPC to [%d]", i)
 			args := rf.generateAEargs(i)
-			go rf.sendAEtoPeer(rf.currentTerm, myCouldCommit, i, args)
+			go rf.sendAEtoPeer(i, args)
 		}
 	}
 
@@ -913,6 +920,7 @@ func (rf *Raft) setCandidate() {
 func (rf *Raft) setLeader() {
 	rf.status = LEADER
 	rf.heartbeatTime = time.Now()
+	rf.firstIndex = -1
 
 	if rf.nextIndex == nil {
 		rf.nextIndex = make([]int, len(rf.peers))
@@ -980,10 +988,10 @@ func (rf *Raft) heartbeatTicker(savedHeartbeatTerm int) {
 
 		if rf.triggerAE {
 			rf.triggerAE = false
-			rf.doHeartbeat(true)
+			rf.doHeartbeat()
 			rf.resetHeartbeatTime()
 		} else if time.Now().After(rf.heartbeatTime) {
-			rf.doHeartbeat(false)
+			rf.doHeartbeat()
 			rf.resetHeartbeatTime()
 		}
 
