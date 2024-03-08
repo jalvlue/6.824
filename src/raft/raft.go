@@ -425,7 +425,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.DPritf(dLog, "receive heartbeat RPC from leader [%d]", args.LeaderID)
+	rf.DPritf(dLog, "receive heartbeat RPC from leader [%d], LeaderTerm: %d, LeaderPrevLogIndex: %d, LeaderPrevLogTerm: %d, LeaderCommit: %d", args.LeaderID, args.LeaderTerm, args.LeaderPrevLogIndex, args.LeaderPrevLogTerm, args.LeaderCommit)
 
 	reply.Term = rf.currentTerm
 	reply.Success = false
@@ -456,7 +456,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// heartbeat without logs
 	if args.LogEntries == nil {
+		rf.DPritf(dLog, "heartbeat without logs")
 		rf.checkConflict(args, reply)
+		if reply.Success {
+			rf.DPritf(dLog, "I do have logs before args.LeaderPrevLogIndex")
+		}
 	} else {
 		// heartbeat with logs
 		argsEntriesLen := len(args.LogEntries)
@@ -468,6 +472,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// i.e. this AE is out-of-date
 		if myArgsLastLogTerm := rf.getLogEntryTerm(leaderArgsLastLogIndex); myArgsLastLogTerm == leaderArgsLastLogTerm {
 			reply.Success = true
+			rf.DPritf(dLog, "I do have receive newer heartbeats, and own all logs of this AE")
 		} else {
 
 			rf.checkConflict(args, reply)
@@ -578,7 +583,8 @@ func (rf *Raft) generateAEargs(server int) *AppendEntriesArgs {
 	prevLogIndex := ni - 1
 	prevLogTerm := 0
 	if prevLogIndex > 0 {
-		prevLogTerm = rf.log[prevLogIndex-1].Term
+		// prevLogTerm = rf.log[prevLogIndex-1].Term
+		prevLogTerm = rf.getLogEntryTerm(prevLogIndex)
 	}
 
 	// use a nil slice instead of adding a logsLength field
@@ -611,10 +617,8 @@ func (rf *Raft) sendAEtoPeer(server int, args *AppendEntriesArgs) {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
 
-		rf.DPritf(dLeader, "receive heartbeat RPC reply from [%d], {%v}\n", server, reply)
-
 		if rf.status != LEADER {
-			rf.DPritf(dDrop, "no longer a leader, discard reply")
+			// rf.DPritf(dDrop, "no longer a leader, discard reply")
 			return
 		}
 
@@ -628,6 +632,8 @@ func (rf *Raft) sendAEtoPeer(server int, args *AppendEntriesArgs) {
 			rf.persist()
 			return
 		}
+
+		rf.DPritf(dLeader, "receive heartbeat RPC reply from [%d], replyTerm: %d, replySuccess: %v, replyXterm: %d, replyXIndex: %d, replyXLen: %d\n", server, reply.Term, reply.Success, reply.XTerm, reply.XIndex, reply.XLen)
 
 		// follower do have LeaderPrevLogIndex and LeaderPrevLogTerm
 		if reply.Success {
@@ -726,8 +732,8 @@ func (rf *Raft) sendAEtoPeer(server int, args *AppendEntriesArgs) {
 			// resent a rpc with nextIndex decrease to this follower
 			// immediately, instead of waiting for HEARTBEAT_INTERVAL
 			// TODO: consider it
-			newArgs := rf.generateAEargs(server)
-			go rf.sendAEtoPeer(server, newArgs)
+			// newArgs := rf.generateAEargs(server)
+			// go rf.sendAEtoPeer(server, newArgs)
 		}
 	}
 }
@@ -744,9 +750,14 @@ func (rf *Raft) doHeartbeat() {
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			// send heartbeat RPCs to all other peers
-			rf.DPritf(dLeader, "send heartbeat RPC to [%d]", i)
 			args := rf.generateAEargs(i)
 			go rf.sendAEtoPeer(i, args)
+			rf.DPritf(dLeader, "send heartbeat RPC to [%d], LeaderTerm: %d, LeaderPrevLogIndex: %d, LeaderPrevLogTerm: %d, LeaderCommit: %d", i, args.LeaderTerm, args.LeaderPrevLogIndex, args.LeaderPrevLogTerm, args.LeaderCommit)
+			if args.LogEntries == nil {
+				rf.DPritf(dLeader, "without logs")
+			} else {
+				rf.DPritf(dLeader, "with logs: {%d->%d}\n", args.LeaderPrevLogIndex+1, args.LeaderPrevLogIndex+len(args.LogEntries))
+			}
 		}
 	}
 
@@ -800,10 +811,8 @@ func (rf *Raft) doElection(savedCandidateTerm int) {
 						rf.mu.Lock()
 						defer rf.mu.Unlock()
 
-						rf.DPritf(dVote, "receive RequestVote RPC reply from [%d], {%v}\n", server, reply)
-
 						if electionDone {
-							rf.DPritf(dDrop, "election done, ignore reply from [%d]\n", server)
+							// rf.DPritf(dDrop, "election done, ignore reply from [%d]\n", server)
 							return
 						}
 
@@ -819,14 +828,14 @@ func (rf *Raft) doElection(savedCandidateTerm int) {
 
 						if rf.status != CANDIDATE {
 							// no longer a candidate
-							rf.DPritf(dVote, "no longer a candidate, ignore reply\n")
+							// rf.DPritf(dVote, "no longer a candidate, ignore reply\n")
 							electionDone = true
 							return
 						}
 
 						if savedCandidateTerm < rf.currentTerm {
 							// this election is no longer needed
-							rf.DPritf(dVote, "new term detected, ignore reply\n")
+							// rf.DPritf(dVote, "new term detected, ignore reply\n")
 							electionDone = true
 							return
 						}
@@ -843,6 +852,8 @@ func (rf *Raft) doElection(savedCandidateTerm int) {
 							electionDone = true
 							return
 						}
+
+						rf.DPritf(dVote, "receive RequestVote RPC reply from [%d], {%v}\n", server, reply)
 
 						if reply.VoteGranted {
 							voteReceived[server] = true
@@ -943,7 +954,6 @@ func (rf *Raft) setLeader() {
 	for i := range rf.matchIndex {
 		rf.matchIndex[i] = 0
 	}
-	rf.matchIndex[rf.me] = len(rf.log)
 }
 
 // expect the caller to hold the read lock
