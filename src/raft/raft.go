@@ -99,9 +99,10 @@ type Raft struct {
 	// index of first client request to this leader
 	// -1 as default, with rf.firstIndex == -1,
 	// this leader would not commit logs which appended by former leaders
-	firstIndex    int
-	heartbeatTime time.Time
-	triggerAE     bool
+	firstIndex           int
+	heartbeatTime        time.Time
+	triggerAE            bool
+	leaderHeartbeatCount int
 }
 
 type LogEntry struct {
@@ -161,7 +162,7 @@ func (rf *Raft) persist() {
 	// rf.mu.RLock()
 	// defer rf.mu.RUnlock()
 
-	start := time.Now()
+	// start := time.Now()
 
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
@@ -182,9 +183,10 @@ func (rf *Raft) persist() {
 	}
 	rf.persister.Save(w.Bytes(), nil)
 
-	elapsed := time.Since(start)
+	// elapsed := time.Since(start)
+	// test: write persist would take 1~3ms
 	lastLogIndex, lastLogTerm := rf.lastLogInfo()
-	rf.DPritf(dPersist, "write persist success, takes (%dms), currentTerm: %d, votedFor:%d, lastLogTerm: %d, lastLogIndex: %d\n", elapsed.Milliseconds(), rf.currentTerm, rf.votedFor, lastLogTerm, lastLogIndex)
+	rf.DPritf(dPersist, "write persist success, currentTerm: %d, votedFor:%d, lastLogTerm: %d, lastLogIndex: %d\n", rf.currentTerm, rf.votedFor, lastLogTerm, lastLogIndex)
 }
 
 type persistStates struct {
@@ -212,7 +214,7 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.yyy = yyy
 	// }
 
-	start := time.Now()
+	// start := time.Now()
 
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
@@ -235,9 +237,10 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.log = ps.Log
 	}
 
-	elapsed := time.Since(start)
+	// elapsed := time.Since(start)
+	// test: the process of reading persist would take 1~3ms
 	lastLogIndex, lastLogTerm := rf.lastLogInfo()
-	rf.DPritf(dPersist, "read persist success, takes (%dms), currentTerm: %d, votedFor:%d, lastLogTerm: %d, lastLogIndex: %d\n", elapsed.Milliseconds(), rf.currentTerm, rf.votedFor, lastLogTerm, lastLogIndex)
+	rf.DPritf(dPersist, "read persist success, currentTerm: %d, votedFor:%d, lastLogTerm: %d, lastLogIndex: %d\n", rf.currentTerm, rf.votedFor, lastLogTerm, lastLogIndex)
 }
 
 // the service says it has created a snapshot that has
@@ -609,7 +612,7 @@ func (rf *Raft) generateAEargs(server int) *AppendEntriesArgs {
 // make function that send RPC to one follower a named method
 // so that once a follower return reply.Success = false, we could
 // resend a RPC with new nextIndex immediately
-func (rf *Raft) sendAEtoPeer(server int, args *AppendEntriesArgs) {
+func (rf *Raft) sendAEtoPeer(server int, args *AppendEntriesArgs, savedLeaderHeartbeatCount int) {
 	reply := &AppendEntriesReply{}
 	ok := rf.sendAppendEntries(server, args, reply)
 
@@ -634,6 +637,11 @@ func (rf *Raft) sendAEtoPeer(server int, args *AppendEntriesArgs) {
 		}
 
 		rf.DPritf(dLeader, "receive heartbeat RPC reply from [%d], replyTerm: %d, replySuccess: %v, replyXterm: %d, replyXIndex: %d, replyXLen: %d\n", server, reply.Term, reply.Success, reply.XTerm, reply.XIndex, reply.XLen)
+
+		if reply.Term < rf.currentTerm {
+			rf.DPritf(dDrop, "reply from previous term, discard reply\n")
+			return
+		}
 
 		// follower do have LeaderPrevLogIndex and LeaderPrevLogTerm
 		if reply.Success {
@@ -703,6 +711,11 @@ func (rf *Raft) sendAEtoPeer(server int, args *AppendEntriesArgs) {
 
 			// finish faster match with XTerm & XIndex & XLen
 
+			// heartbeat reply out-of-date, do not update nextIndex depend on it
+			if rf.leaderHeartbeatCount > savedLeaderHeartbeatCount {
+				return
+			}
+
 			// follower's log is too short
 			if reply.XLen != -1 {
 				rf.nextIndex[server] = reply.XLen + 1
@@ -727,13 +740,12 @@ func (rf *Raft) sendAEtoPeer(server int, args *AppendEntriesArgs) {
 				}
 			}
 
-			rf.DPritf(dLog2, "prevLog mismatch, try nextIndex: %d\n", rf.nextIndex[server])
-
 			// resent a rpc with nextIndex decrease to this follower
 			// immediately, instead of waiting for HEARTBEAT_INTERVAL
-			// TODO: consider it
-			// newArgs := rf.generateAEargs(server)
-			// go rf.sendAEtoPeer(server, newArgs)
+			newArgs := rf.generateAEargs(server)
+			go rf.sendAEtoPeer(server, newArgs, savedLeaderHeartbeatCount)
+
+			rf.DPritf(dLog2, "prevLog mismatch, send AE with nextIndex: {%d}\n", rf.nextIndex[server])
 		}
 	}
 }
@@ -747,11 +759,12 @@ func (rf *Raft) sendAEtoPeer(server int, args *AppendEntriesArgs) {
 func (rf *Raft) doHeartbeat() {
 	rf.DPritf(dLog, "begin sending heartbeat RPCs to followers\n")
 
+	rf.leaderHeartbeatCount += 1
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			// send heartbeat RPCs to all other peers
 			args := rf.generateAEargs(i)
-			go rf.sendAEtoPeer(i, args)
+			go rf.sendAEtoPeer(i, args, rf.leaderHeartbeatCount)
 			rf.DPritf(dLeader, "send heartbeat RPC to [%d], LeaderTerm: %d, LeaderPrevLogIndex: %d, LeaderPrevLogTerm: %d, LeaderCommit: %d", i, args.LeaderTerm, args.LeaderPrevLogIndex, args.LeaderPrevLogTerm, args.LeaderCommit)
 			if args.LogEntries == nil {
 				rf.DPritf(dLeader, "without logs")
@@ -932,6 +945,7 @@ func (rf *Raft) setLeader() {
 	rf.status = LEADER
 	rf.heartbeatTime = time.Now()
 	rf.firstIndex = -1
+	rf.leaderHeartbeatCount = -1
 
 	if rf.nextIndex == nil {
 		rf.nextIndex = make([]int, len(rf.peers))
