@@ -103,6 +103,12 @@ type Raft struct {
 	heartbeatTime        time.Time
 	triggerAE            bool
 	leaderHeartbeatCount int
+
+	// snapshot of the server, lastIndex info in that snapshot
+	// (0, 0) for nil snapshot
+	snapshot          []byte
+	lastIncludedTerm  int
+	lastIncludedIndex int
 }
 
 type LogEntry struct {
@@ -111,10 +117,37 @@ type LogEntry struct {
 }
 
 // expect the caller to hold the lock
+// get logic index, term of last log
+func (rf *Raft) lastLogInfo() (int, int) {
+	lastLogIndex := rf.getLastIndex()
+	lastLogTerm := rf.getLogEntryTerm(lastLogIndex)
+	return lastLogIndex, lastLogTerm
+}
+
+// expect the caller to hold the lock
+func (rf *Raft) getSlicePosition(logicIndex int) int {
+	return logicIndex - rf.lastIncludedIndex - 1
+}
+
+// expect the caller to hold the lock
+// TODO: maybe add rf.lastIndex field
+func (rf *Raft) getLastIndex() int {
+	return len(rf.log) + rf.lastIncludedIndex
+}
+
+// expect the caller to hold the lock
 func (rf *Raft) getLogEntryTerm(index int) int {
-	// 0-th index and 0 term
-	if index <= 0 {
-		return 0
+	index -= rf.lastIncludedIndex
+
+	// the index is 0 or is snapshoted as lastIncludedIndex
+	if index == 0 {
+		return rf.lastIncludedTerm
+	}
+
+	// the index is snapshoted and not the lastIncludedIndex
+	// happends in unreliable out-of-date requests
+	if index < 0 {
+		return -2
 	}
 
 	// do not have the index-th log entry
@@ -127,6 +160,7 @@ func (rf *Raft) getLogEntryTerm(index int) int {
 
 // expect the caller to hold the lock
 func (rf *Raft) getLogEntryCommand(index int) interface{} {
+	index -= rf.lastIncludedIndex
 	return rf.log[index-1].Command
 }
 
@@ -173,15 +207,17 @@ func (rf *Raft) persist() {
 	// copy(pLog, rf.log)
 
 	persistState := persistStates{
-		Term:     rf.currentTerm,
-		VotedFor: rf.votedFor,
-		Log:      rf.log,
+		Term:              rf.currentTerm,
+		VotedFor:          rf.votedFor,
+		Log:               rf.log,
+		LastIncludedIndex: rf.lastIncludedIndex,
+		LastIncludedTerm:  rf.lastIncludedTerm,
 	}
 
 	if err := e.Encode(persistState); err != nil {
 		panic(fmt.Errorf("persist encode fail: %w", err))
 	}
-	rf.persister.Save(w.Bytes(), nil)
+	rf.persister.Save(w.Bytes(), rf.snapshot)
 
 	// elapsed := time.Since(start)
 	// test: write persist would take 1~3ms
@@ -190,14 +226,16 @@ func (rf *Raft) persist() {
 }
 
 type persistStates struct {
-	Term     int
-	VotedFor int
-	Log      []LogEntry
+	Term              int
+	VotedFor          int
+	Log               []LogEntry
+	LastIncludedIndex int
+	LastIncludedTerm  int
 }
 
 // restore previously persisted state.
-func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+func (rf *Raft) readPersist(state, snapshot []byte) {
+	if state == nil || len(state) < 1 { // bootstrap without any state?
 		return
 	}
 	// Your code here (2C).
@@ -216,7 +254,7 @@ func (rf *Raft) readPersist(data []byte) {
 
 	// start := time.Now()
 
-	r := bytes.NewBuffer(data)
+	r := bytes.NewBuffer(state)
 	d := labgob.NewDecoder(r)
 
 	var ps persistStates
@@ -235,7 +273,27 @@ func (rf *Raft) readPersist(data []byte) {
 		// so just point rf.log to ps.Log
 		// since it is a copy
 		rf.log = ps.Log
+
+		rf.lastIncludedTerm = ps.LastIncludedTerm
+		rf.lastIncludedIndex = ps.LastIncludedIndex
 	}
+
+	// @Param snapshot is a copy from rf.persister
+	// so we can reference it safely
+	rf.snapshot = snapshot
+
+	// send snapshot to rf.applyChan in other goroutine
+	// to avoid deadlock( Make() --> rf.readPersist() --> return rf --> setup rf.applyChan --> Make() )
+	go func() {
+		// everythin passed in a literal expression would be copy
+		rf.applyChan <- ApplyMsg{
+			CommandValid:  false,
+			SnapshotValid: true,
+			Snapshot:      snapshot,
+			SnapshotTerm:  rf.lastIncludedTerm,
+			SnapshotIndex: rf.lastIncludedIndex,
+		}
+	}()
 
 	// elapsed := time.Since(start)
 	// test: the process of reading persist would take 1~3ms
@@ -250,6 +308,158 @@ func (rf *Raft) readPersist(data []byte) {
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 
+	// the caller(tester or service) would only call rf.Snapshot
+	// while sending log commit to rf.applyCh,
+	// i.e. the caller would hold the lock
+	// rf.mu.Lock()
+	// defer rf.mu.Unlock()
+
+	// the caller just simply notice rf that
+	// it has created a snapshot,
+	// so we can use these infomations to trim logs later
+	// instead of immediately which would cause data race.
+	go func() {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+
+		// out-of-date snapshot
+		if index < rf.lastIncludedIndex {
+			return
+		}
+
+		rf.DPritf(dSnap, "snapshot created, lastIncludedIndex: {%d}\n", index)
+
+		rf.lastIncludedTerm = rf.getLogEntryTerm(index)
+		rf.log = rf.log[index-rf.lastIncludedIndex:]
+		rf.lastIncludedIndex = index
+		rf.snapshot = snapshot
+		rf.persist()
+	}()
+}
+
+type InstallSnapshotArgs struct {
+	LeaderTerm        int
+	LeaderID          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Snapshot          []byte
+	LogEntries        []LogEntry
+}
+
+type InstallSnapshotReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+
+	doPersist := false
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.currentTerm
+	reply.Success = false
+
+	rf.DPritf(dSnap, "receive InstallSnapshot RPC from leader [%d], args.LastIncludedTerm: %d, args.LastIncludedIndex: %d, args.LogEntriesLength: %d\n", args.LeaderID, args.LastIncludedTerm, args.LastIncludedIndex, len(args.LogEntries))
+
+	if rf.currentTerm > args.LeaderTerm {
+		rf.DPritf(dLog, "in a higher term, ignore InstallSnapshot RPC and notify leader [%d]\n", args.LeaderID)
+		return
+	} else if rf.currentTerm == args.LeaderTerm {
+		if rf.status != FOLLOWER {
+			rf.status = FOLLOWER
+		}
+		rf.resetElectionTime()
+	} else {
+		rf.DPritf(dLog, "in a lower term, convert to follower\n")
+		rf.setFollower(args.LeaderTerm, NO_VOTE)
+		rf.resetElectionTime()
+		go rf.electionTicker(rf.currentTerm)
+
+		doPersist = true
+		reply.Term = rf.currentTerm
+	}
+
+	// TODO: handle unreliable
+	rf.snapshot = args.Snapshot
+	rf.lastIncludedTerm = args.LastIncludedTerm
+	rf.lastIncludedIndex = args.LastIncludedIndex
+	rf.commitIndex = args.LastIncludedIndex
+
+	rf.log = []LogEntry{}
+	rf.log = append(rf.log, args.LogEntries...)
+
+	rf.applyChan <- ApplyMsg{
+		CommandValid:  false,
+		SnapshotValid: true,
+		Snapshot:      args.Snapshot,
+		SnapshotTerm:  args.LastIncludedTerm,
+		SnapshotIndex: args.LastIncludedIndex,
+	}
+
+	reply.Success = true
+
+	rf.DPritf(dSnap, "install snapshot success, myLastIncludedTerm: %d, myLastIncludedIndex: %d, myLastIndex: %d, myCommitIndex: %d\n", rf.lastIncludedTerm, rf.lastIncludedIndex, rf.getLastIndex(), rf.commitIndex)
+
+	if doPersist {
+		rf.persist()
+	}
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendIStoPeer(server int) {
+	rf.mu.Lock()
+
+	snapshotToSend := make([]byte, len(rf.snapshot))
+	copy(snapshotToSend, rf.snapshot)
+	logsEntriesToSend := make([]LogEntry, len(rf.log))
+	copy(logsEntriesToSend, rf.log)
+
+	args := &InstallSnapshotArgs{
+		LeaderTerm:        rf.currentTerm,
+		LeaderID:          rf.me,
+		LastIncludedIndex: rf.lastIncludedIndex,
+		LastIncludedTerm:  rf.lastIncludedTerm,
+		Snapshot:          snapshotToSend,
+		LogEntries:        logsEntriesToSend,
+	}
+	rf.mu.Unlock()
+
+	reply := &InstallSnapshotReply{}
+
+	ok := rf.sendInstallSnapshot(server, args, reply)
+	if ok {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+
+		if reply.Term > rf.currentTerm {
+			rf.setFollower(reply.Term, NO_VOTE)
+			rf.resetElectionTime()
+			go rf.electionTicker(rf.currentTerm)
+
+			rf.DPritf(dTimer, "lagging behind other peers, install snapshot abort, convert to follower\n")
+
+			rf.persist()
+			return
+		}
+
+		rf.DPritf(dSnap, "receive InstallSnapshot RPC reply from [%d], reply.Term: %d, reply.Success: %v\n", server, reply.Term, reply.Success)
+
+		if reply.Term < rf.currentTerm {
+			rf.DPritf(dDrop, "reply from previous term, discard reply\n")
+			return
+		}
+
+		if reply.Success {
+			rf.matchIndex[server] = args.LastIncludedIndex + len(args.LogEntries)
+			rf.nextIndex[server] = rf.matchIndex[server] + 1
+		}
+	}
 }
 
 // example RequestVote RPC arguments structure.
@@ -402,12 +612,12 @@ func (rf *Raft) checkConflict(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if myPrevLogTerm := rf.getLogEntryTerm(args.LeaderPrevLogIndex); myPrevLogTerm != args.LeaderPrevLogTerm {
 		// follower's log is too short for LeaderPrevLogIndex
 		if myPrevLogTerm == -1 {
-			reply.XLen = len(rf.log)
+			reply.XLen = rf.getLastIndex()
 			return
 		}
 
 		var index int
-		for index = args.LeaderPrevLogIndex - 1; index > 0 && rf.getLogEntryTerm(index) == myPrevLogTerm; index-- {
+		for index = args.LeaderPrevLogIndex - 1; index > rf.lastIncludedIndex && rf.getLogEntryTerm(index) == myPrevLogTerm; index-- {
 		}
 
 		reply.XTerm = myPrevLogTerm
@@ -452,9 +662,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		rf.DPritf(dLog, "in a lower term, convert to follower\n")
 		rf.setFollower(args.LeaderTerm, NO_VOTE)
-		doPersist = true
 		rf.resetElectionTime()
 		go rf.electionTicker(rf.currentTerm)
+
+		doPersist = true
+		reply.Term = rf.currentTerm
 	}
 
 	// heartbeat without logs
@@ -483,7 +695,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if reply.Success {
 				matchIdx := args.LeaderPrevLogIndex
 				// discard mismatched logs
-				rf.log = rf.log[:matchIdx]
+				rf.log = rf.log[:rf.getSlicePosition(matchIdx)+1]
 				// append leader's log
 				rf.log = append(rf.log, args.LogEntries...)
 
@@ -498,15 +710,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// do commit
 	if reply.Success {
 		if args.LeaderCommit > rf.commitIndex {
-			for i := rf.commitIndex + 1; i <= args.LeaderCommit && i <= len(rf.log); i++ {
+			myLastLogIndex := rf.getLastIndex()
+			index := rf.commitIndex + 1
+			if rf.commitIndex < rf.lastIncludedIndex {
+				index = rf.lastIncludedIndex + 1
+			}
+			for ; index <= args.LeaderCommit && index <= myLastLogIndex; index++ {
+				rf.commitIndex = index
+				rf.DPritf(dCommit, "commitIndex: {%d}\n", index)
+
 				rf.applyChan <- ApplyMsg{
 					CommandValid: true,
-					CommandIndex: i,
-					Command:      rf.getLogEntryCommand(i),
+					CommandIndex: index,
+					Command:      rf.getLogEntryCommand(index),
 				}
-
-				rf.commitIndex += 1
-				rf.DPritf(dCommit, "commitIndex: {%d}\n", rf.commitIndex)
 			}
 		}
 	}
@@ -537,7 +754,7 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	index = len(rf.log) + 1
+	index = rf.getLastIndex() + 1
 	term = rf.currentTerm
 	isLeader = rf.status == LEADER
 
@@ -546,8 +763,8 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 	}
 
 	rf.log = append(rf.log, LogEntry{term, command})
-	rf.matchIndex[rf.me] = len(rf.log)
-	rf.DPritf(dClient, "new log append to leader [%d], newLogTerm: %d, newLogIndex: %d\n", rf.me, term, len(rf.log))
+	rf.matchIndex[rf.me] = index
+	rf.DPritf(dClient, "new log append to leader [%d], newLogTerm: %d, newLogIndex: %d\n", rf.me, term, index)
 	rf.persist()
 
 	rf.triggerAE = true
@@ -581,23 +798,28 @@ func (rf *Raft) killed() bool {
 
 // expect the caller to hold the lock
 // generate and return a AppendEntriesArg for a specific server
-func (rf *Raft) generateAEargs(server int) *AppendEntriesArgs {
-	ni := rf.nextIndex[server]
-	prevLogIndex := ni - 1
+func (rf *Raft) generateAEargs(server int) (args *AppendEntriesArgs, doInstallSnapshot bool) {
+	firstLogIndexToSend := rf.nextIndex[server]
+	prevLogIndex := firstLogIndexToSend - 1
 	prevLogTerm := 0
-	if prevLogIndex > 0 {
-		// prevLogTerm = rf.log[prevLogIndex-1].Term
+
+	// the leader has already snapshoted logs before prevLogIndex
+	// send IS instead of AE
+	if prevLogIndex < rf.lastIncludedIndex {
+		doInstallSnapshot = true
+		return
+	} else {
 		prevLogTerm = rf.getLogEntryTerm(prevLogIndex)
 	}
 
 	// use a nil slice instead of adding a logsLength field
 	var entries []LogEntry = nil
-	if logsToSendLength := len(rf.log) - prevLogIndex; logsToSendLength > 0 {
+	if logsToSendLength := rf.getLastIndex() - prevLogIndex; logsToSendLength > 0 {
 		entries = make([]LogEntry, logsToSendLength)
-		copy(entries, rf.log[prevLogIndex:])
+		copy(entries, rf.log[rf.getSlicePosition(firstLogIndexToSend):])
 	}
 
-	args := &AppendEntriesArgs{
+	args = &AppendEntriesArgs{
 		LeaderTerm:         rf.currentTerm,
 		LeaderID:           rf.me,
 		LeaderPrevLogIndex: prevLogIndex,
@@ -606,7 +828,7 @@ func (rf *Raft) generateAEargs(server int) *AppendEntriesArgs {
 		LeaderCommit:       rf.commitIndex,
 	}
 
-	return args
+	return
 }
 
 // make function that send RPC to one follower a named method
@@ -660,7 +882,7 @@ func (rf *Raft) sendAEtoPeer(server int, args *AppendEntriesArgs, savedLeaderHea
 
 					// do increment commit
 					if couldCommit {
-						rf.DPritf(dLeader, "check if have some entries to commit, leaderCommitIndex: {%d}, leaderLastIndex: {%d}\n", rf.commitIndex, len(rf.log))
+						rf.DPritf(dLeader, "check if have some entries to commit, leaderCommitIndex: {%d}, leaderLastIndex: {%d}\n", rf.commitIndex, rf.getLastIndex())
 
 						doApply := false
 						savedCommitedIndex := rf.commitIndex
@@ -670,7 +892,7 @@ func (rf *Raft) sendAEtoPeer(server int, args *AppendEntriesArgs, savedLeaderHea
 							if savedCommitedIndex > index {
 								index = savedCommitedIndex + 1
 							}
-							for ; index <= len(rf.log); index++ {
+							for ; index <= rf.getLastIndex(); index++ {
 								matchCount := 0
 								for j := range rf.peers {
 									if index <= rf.matchIndex[j] {
@@ -717,20 +939,27 @@ func (rf *Raft) sendAEtoPeer(server int, args *AppendEntriesArgs, savedLeaderHea
 			}
 
 			// follower's log is too short
+			// -----          follower's log
+			//        -----   logEntries in AE
 			if reply.XLen != -1 {
 				rf.nextIndex[server] = reply.XLen + 1
 			} else {
 
 				// leader do not have XTerm
+				// ------
+				//     -----
+				// (4, 4) vs (3, 4)
 				if reply.XTerm > args.LeaderPrevLogTerm {
 					rf.nextIndex[server] = reply.XIndex
 				} else {
-					// TODO: may have some bugs with snapshot i guess
 
 					// follower have logs before prevLogTerm : logs in XTerm
 					// try the last log of follower reply conflicting term
+					// ------
+					//     -----
+					// (2, 4) vs (3, 4)
 					i := args.LeaderPrevLogIndex
-					rf.nextIndex[server] = 1
+					rf.nextIndex[server] = rf.lastIncludedIndex + 1
 					for ; i > 0; i-- {
 						if rf.getLogEntryTerm(i) <= reply.XTerm {
 							rf.nextIndex[server] = i + 1
@@ -742,17 +971,21 @@ func (rf *Raft) sendAEtoPeer(server int, args *AppendEntriesArgs, savedLeaderHea
 
 			// resent a rpc with nextIndex decrease to this follower
 			// immediately, instead of waiting for HEARTBEAT_INTERVAL
-			newArgs := rf.generateAEargs(server)
-			go rf.sendAEtoPeer(server, newArgs, savedLeaderHeartbeatCount)
-
-			rf.DPritf(dLog2, "prevLog mismatch, send AE with nextIndex: {%d}\n", rf.nextIndex[server])
+			newArgs, doInstallSnapshot := rf.generateAEargs(server)
+			if doInstallSnapshot {
+				go rf.sendIStoPeer(server)
+				rf.DPritf(dLog2, "prevLog mismatch, send IS to [%d]\n", server)
+			} else {
+				go rf.sendAEtoPeer(server, newArgs, savedLeaderHeartbeatCount)
+				rf.DPritf(dLog2, "prevLog mismatch, send AE with nextIndex: {%d}\n", rf.nextIndex[server])
+			}
 		}
 	}
 }
 
 // expect the caller to hold the read lock
 // launch a bunch of goroutines to
-// send heartbeat/appendEntries RPCs to all other peers
+// send installSnapshot/appendEntries RPCs to all other peers
 // and return immediately
 // couldCommit only when triggered by Start()
 // to avoid helping commit logs belongs to former leaders
@@ -763,13 +996,18 @@ func (rf *Raft) doHeartbeat() {
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			// send heartbeat RPCs to all other peers
-			args := rf.generateAEargs(i)
-			go rf.sendAEtoPeer(i, args, rf.leaderHeartbeatCount)
-			rf.DPritf(dLeader, "send heartbeat RPC to [%d], LeaderTerm: %d, LeaderPrevLogIndex: %d, LeaderPrevLogTerm: %d, LeaderCommit: %d", i, args.LeaderTerm, args.LeaderPrevLogIndex, args.LeaderPrevLogTerm, args.LeaderCommit)
-			if args.LogEntries == nil {
-				rf.DPritf(dLeader, "without logs")
+			args, doInstallSnapshot := rf.generateAEargs(i)
+			if doInstallSnapshot {
+				go rf.sendIStoPeer(i)
+				rf.DPritf(dLeader, "send InstallSnapshot RPC to [%d]\n", i)
 			} else {
-				rf.DPritf(dLeader, "with logs: {%d->%d}\n", args.LeaderPrevLogIndex+1, args.LeaderPrevLogIndex+len(args.LogEntries))
+				go rf.sendAEtoPeer(i, args, rf.leaderHeartbeatCount)
+				rf.DPritf(dLeader, "send heartbeat RPC to [%d], LeaderTerm: %d, LeaderPrevLogIndex: %d, LeaderPrevLogTerm: %d, LeaderCommit: %d", i, args.LeaderTerm, args.LeaderPrevLogIndex, args.LeaderPrevLogTerm, args.LeaderCommit)
+				if args.LogEntries == nil {
+					rf.DPritf(dLeader, "without logs")
+				} else {
+					rf.DPritf(dLeader, "with logs: {%d->%d}\n", args.LeaderPrevLogIndex+1, args.LeaderPrevLogIndex+len(args.LogEntries))
+				}
 			}
 		}
 	}
@@ -957,8 +1195,9 @@ func (rf *Raft) setLeader() {
 	// set next log entry index sending to peers to
 	// leader's last log index+1
 	// at the very beginning of being a leader
+	ni := rf.getLastIndex() + 1
 	for i := range rf.nextIndex {
-		rf.nextIndex[i] = len(rf.log) + 1
+		rf.nextIndex[i] = ni
 	}
 
 	// set highest match log entry index too peers
@@ -968,6 +1207,7 @@ func (rf *Raft) setLeader() {
 	for i := range rf.matchIndex {
 		rf.matchIndex[i] = 0
 	}
+	rf.matchIndex[rf.me] = ni - 1
 }
 
 // expect the caller to hold the read lock
@@ -982,14 +1222,6 @@ func (rf *Raft) statusString() string {
 	default:
 		return "UNKNOWN"
 	}
-}
-
-// expect the caller to hold the lock
-// get index, term of last log
-func (rf *Raft) lastLogInfo() (int, int) {
-	lastLogIndex := len(rf.log)
-	lastLogTerm := rf.getLogEntryTerm(lastLogIndex)
-	return lastLogIndex, lastLogTerm
 }
 
 // leader's heartbeat ticker
@@ -1120,20 +1352,23 @@ func Make(
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf := &Raft{
-		peers:       peers,
-		persister:   persister,
-		me:          me,
-		currentTerm: 0,
-		votedFor:    NO_VOTE,
-		log:         make([]LogEntry, 0),
-		commitIndex: 0,
-		lastApplied: 0,
-		status:      FOLLOWER,
-		applyChan:   applyCh,
+		peers:             peers,
+		persister:         persister,
+		me:                me,
+		currentTerm:       0,
+		votedFor:          NO_VOTE,
+		log:               make([]LogEntry, 0),
+		commitIndex:       0,
+		lastApplied:       0,
+		status:            FOLLOWER,
+		applyChan:         applyCh,
+		snapshot:          nil,
+		lastIncludedTerm:  0,
+		lastIncludedIndex: 0,
 	}
 
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+	rf.readPersist(persister.ReadRaftState(), persister.ReadSnapshot())
 
 	rf.resetElectionTime()
 	go rf.electionTicker(rf.currentTerm)
