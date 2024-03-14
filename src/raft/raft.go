@@ -223,7 +223,7 @@ func (rf *Raft) persist() {
 	// elapsed := time.Since(start)
 	// test: write persist would take 1~3ms
 	lastLogIndex, lastLogTerm := rf.lastLogInfo()
-	rf.DPritf(dPersist, "write persist success, currentTerm: %d, votedFor:%d, lastLogTerm: %d, lastLogIndex: %d\n", rf.currentTerm, rf.votedFor, lastLogTerm, lastLogIndex)
+	rf.DPrintf(dPersist, "write persist success, currentTerm: %d, votedFor:%d, lastLogTerm: %d, lastLogIndex: %d\n", rf.currentTerm, rf.votedFor, lastLogTerm, lastLogIndex)
 }
 
 type persistStates struct {
@@ -289,6 +289,11 @@ func (rf *Raft) readPersist(state, snapshot []byte) {
 	if len(snapshot) != 0 {
 		go func() {
 			// everything passed in a literal expression would be copy
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			rf.DPrintf(dSnap, "send snapshot to service, snapshotTerm: %d, snapshotIndex: %d\n", rf.lastIncludedTerm, rf.lastIncludedIndex)
+
 			rf.applyChan <- ApplyMsg{
 				CommandValid:  false,
 				SnapshotValid: true,
@@ -302,7 +307,7 @@ func (rf *Raft) readPersist(state, snapshot []byte) {
 	// elapsed := time.Since(start)
 	// test: the process of reading persist would take 1~3ms
 	lastLogIndex, lastLogTerm := rf.lastLogInfo()
-	rf.DPritf(dPersist, "read persist success, currentTerm: %d, votedFor:%d, lastLogTerm: %d, lastLogIndex: %d\n", rf.currentTerm, rf.votedFor, lastLogTerm, lastLogIndex)
+	rf.DPrintf(dPersist, "read persist success, currentTerm: %d, votedFor:%d, lastLogTerm: %d, lastLogIndex: %d\n", rf.currentTerm, rf.votedFor, lastLogTerm, lastLogIndex)
 }
 
 // the service says it has created a snapshot that has
@@ -331,7 +336,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 			return
 		}
 
-		rf.DPritf(dSnap, "snapshot created, lastIncludedIndex: {%d}\n", index)
+		rf.DPrintf(dSnap, "snapshot created, lastIncludedIndex: {%d}\n", index)
 
 		rf.lastIncludedTerm = rf.getLogEntryTerm(index)
 		rf.log = rf.log[index-rf.lastIncludedIndex:]
@@ -364,10 +369,10 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	reply.Term = rf.currentTerm
 
-	rf.DPritf(dSnap, "receive InstallSnapshot RPC from leader [%d], args.LastIncludedTerm: %d, args.LastIncludedIndex: %d, args.LogEntriesLength: %d\n", args.LeaderID, args.LastIncludedTerm, args.LastIncludedIndex, len(args.LogEntries))
+	rf.DPrintf(dSnap, "receive InstallSnapshot RPC from leader [%d], args.LastIncludedTerm: %d, args.LastIncludedIndex: %d, args.LogEntriesLength: %d\n", args.LeaderID, args.LastIncludedTerm, args.LastIncludedIndex, len(args.LogEntries))
 
 	if rf.currentTerm > args.LeaderTerm {
-		rf.DPritf(dLog, "in a higher term, ignore InstallSnapshot RPC and notify leader [%d]\n", args.LeaderID)
+		rf.DPrintf(dLog, "in a higher term, ignore InstallSnapshot RPC and notify leader [%d]\n", args.LeaderID)
 		return
 	} else if rf.currentTerm == args.LeaderTerm {
 		if rf.status != FOLLOWER {
@@ -375,7 +380,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		}
 		rf.resetElectionTime()
 	} else {
-		rf.DPritf(dLog, "in a lower term, convert to follower\n")
+		rf.DPrintf(dLog, "in a lower term, convert to follower\n")
 		rf.setFollower(args.LeaderTerm, NO_VOTE)
 		rf.resetElectionTime()
 		go rf.electionTicker(rf.currentTerm)
@@ -403,9 +408,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 			SnapshotIndex: args.LastIncludedIndex,
 		}
 
-		rf.DPritf(dSnap, "install snapshot success, myLastIncludedTerm: %d, myLastIncludedIndex: %d, myLastIndex: %d, myCommitIndex: %d\n", rf.lastIncludedTerm, rf.lastIncludedIndex, rf.getLastIndex(), rf.commitIndex)
+		rf.DPrintf(dSnap, "install snapshot success, myLastIncludedTerm: %d, myLastIncludedIndex: %d, myLastIndex: %d, myCommitIndex: %d\n", rf.lastIncludedTerm, rf.lastIncludedIndex, rf.getLastIndex(), rf.commitIndex)
 	} else {
-		rf.DPritf(dSnap, "I do have logs newer than args.LastIncludedIndex\n")
+		rf.DPrintf(dSnap, "I do have logs newer than args.LastIncludedIndex\n")
 	}
 
 	reply.FollowerLastIndex = rf.getLastIndex()
@@ -450,16 +455,16 @@ func (rf *Raft) sendIStoPeer(server int) {
 			rf.resetElectionTime()
 			go rf.electionTicker(rf.currentTerm)
 
-			rf.DPritf(dTimer, "lagging behind other peers, install snapshot abort, convert to follower\n")
+			rf.DPrintf(dTimer, "lagging behind other peers, install snapshot abort, convert to follower\n")
 
 			rf.persist()
 			return
 		}
 
-		rf.DPritf(dSnap, "receive InstallSnapshot RPC reply from [%d], reply.Term: %d, reply.Success: %v\n", server, reply.Term, reply.FollowerLastIndex)
+		rf.DPrintf(dSnap, "receive InstallSnapshot RPC reply from [%d], reply.Term: %d, reply.Success: %v\n", server, reply.Term, reply.FollowerLastIndex)
 
 		if reply.Term < rf.currentTerm {
-			rf.DPritf(dDrop, "reply from previous term, discard reply\n")
+			rf.DPrintf(dDrop, "reply from previous term, discard reply\n")
 			return
 		}
 
@@ -496,7 +501,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.DPritf(dVote, "receive RequestVoteRPC from [%d]\n", args.CandidateID)
+	rf.DPrintf(dVote, "receive RequestVoteRPC from [%d]\n", args.CandidateID)
 
 	reply.Term = rf.currentTerm
 	reply.Status = rf.status
@@ -505,7 +510,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// in a higher term
 	// no vote granted
 	if rf.currentTerm > args.CandidateTerm {
-		rf.DPritf(dVote, "in a higher term, no vote granted to [%d]\n", args.CandidateID)
+		rf.DPrintf(dVote, "in a higher term, no vote granted to [%d]\n", args.CandidateID)
 		return
 	}
 
@@ -520,7 +525,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Status = FOLLOWER
 		rf.resetElectionTime()
 		go rf.electionTicker(rf.currentTerm)
-		rf.DPritf(dVote, "in a lower term, convert to follower of this term\n")
+		rf.DPrintf(dVote, "in a lower term, convert to follower of this term\n")
 	}
 
 	myLastLogIndex, myLastLogTerm := rf.lastLogInfo()
@@ -529,16 +534,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if rf.votedFor == NO_VOTE || rf.votedFor == args.CandidateID {
 		if args.CandidateLastLogTerm > myLastLogTerm ||
 			(args.CandidateLastLogTerm == myLastLogTerm && args.CandidateLastLogIndex >= myLastLogIndex) {
-			rf.DPritf(dVote, "vote granted to [%d]\n", args.CandidateID)
+			rf.DPrintf(dVote, "vote granted to [%d]\n", args.CandidateID)
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateID
 			doPersist = true
 			rf.resetElectionTime()
 		} else {
-			rf.DPritf(dVote, "has newer logs, no vote granted to candidate [%d]", args.CandidateID)
+			rf.DPrintf(dVote, "has newer logs, no vote granted to candidate [%d]", args.CandidateID)
 		}
 	} else {
-		rf.DPritf(dDrop, "vote to candidate [%d] in this term, no vote granted to candidate [%d]\n", rf.votedFor, args.CandidateID)
+		rf.DPrintf(dDrop, "vote to candidate [%d] in this term, no vote granted to candidate [%d]\n", rf.votedFor, args.CandidateID)
 	}
 
 	if doPersist {
@@ -646,7 +651,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.DPritf(dLog, "receive heartbeat RPC from leader [%d], LeaderTerm: %d, LeaderPrevLogIndex: %d, LeaderPrevLogTerm: %d, LeaderCommit: %d", args.LeaderID, args.LeaderTerm, args.LeaderPrevLogIndex, args.LeaderPrevLogTerm, args.LeaderCommit)
+	rf.DPrintf(dLog, "receive heartbeat RPC from leader [%d], LeaderTerm: %d, LeaderPrevLogIndex: %d, LeaderPrevLogTerm: %d, LeaderCommit: %d", args.LeaderID, args.LeaderTerm, args.LeaderPrevLogIndex, args.LeaderPrevLogTerm, args.LeaderCommit)
 
 	reply.Term = rf.currentTerm
 	reply.Success = false
@@ -656,7 +661,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if rf.currentTerm > args.LeaderTerm {
 		// in a higher term
-		rf.DPritf(dLog, "in a higher term, ignore heartbeat and notify leader [%d]\n", args.LeaderID)
+		rf.DPrintf(dLog, "in a higher term, ignore heartbeat and notify leader [%d]\n", args.LeaderID)
 		return
 	} else if rf.currentTerm == args.LeaderTerm {
 		// in the same term
@@ -668,7 +673,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// in a lower term
 		// convert to follower of this term
 
-		rf.DPritf(dLog, "in a lower term, convert to follower\n")
+		rf.DPrintf(dLog, "in a lower term, convert to follower\n")
 		rf.setFollower(args.LeaderTerm, NO_VOTE)
 		rf.resetElectionTime()
 		go rf.electionTicker(rf.currentTerm)
@@ -679,10 +684,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// heartbeat without logs
 	if args.LogEntries == nil {
-		rf.DPritf(dLog, "heartbeat without logs")
+		rf.DPrintf(dLog, "heartbeat without logs")
 		rf.checkConflict(args, reply)
 		if reply.Success {
-			rf.DPritf(dLog, "I do have logs before args.LeaderPrevLogIndex")
+			rf.DPrintf(dLog, "I do have logs before args.LeaderPrevLogIndex")
 		}
 	} else {
 		// heartbeat with logs
@@ -695,7 +700,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// i.e. this AE is out-of-date
 		if myArgsLastLogTerm := rf.getLogEntryTerm(leaderArgsLastLogIndex); myArgsLastLogTerm == leaderArgsLastLogTerm {
 			reply.Success = true
-			rf.DPritf(dLog, "I do have receive newer heartbeats, and own all logs of this AE")
+			rf.DPrintf(dLog, "I do have receive newer heartbeats, and own all logs of this AE")
 		} else {
 
 			rf.checkConflict(args, reply)
@@ -710,7 +715,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				doPersist = true
 
 				followerLastIndex, followerLastTerm := rf.lastLogInfo()
-				rf.DPritf(dLog, "log replicated, matchTerm: %d, matchIndex: %d, lastLogTerm: %d, lastLogIndex: %d", args.LeaderPrevLogTerm, matchIdx, followerLastTerm, followerLastIndex)
+				rf.DPrintf(dLog, "log replicated, matchTerm: %d, matchIndex: %d, lastLogTerm: %d, lastLogIndex: %d", args.LeaderPrevLogTerm, matchIdx, followerLastTerm, followerLastIndex)
 			}
 		}
 	}
@@ -725,7 +730,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 			for ; index <= args.LeaderCommit && index <= myLastLogIndex; index++ {
 				rf.commitIndex = index
-				rf.DPritf(dCommit, "commitIndex: {%d}\n", index)
+				rf.DPrintf(dCommit, "commitIndex: {%d}\n", index)
 
 				rf.applyChan <- ApplyMsg{
 					CommandValid: true,
@@ -772,7 +777,7 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 
 	rf.log = append(rf.log, LogEntry{term, command})
 	rf.matchIndex[rf.me] = index
-	rf.DPritf(dClient, "new log append to leader [%d], newLogTerm: %d, newLogIndex: %d\n", rf.me, term, index)
+	rf.DPrintf(dClient, "new log append to leader [%d], newLogTerm: %d, newLogIndex: %d\n", rf.me, term, index)
 	rf.persist()
 
 	rf.triggerAE = true
@@ -860,16 +865,16 @@ func (rf *Raft) sendAEtoPeer(server int, args *AppendEntriesArgs, savedLeaderHea
 			rf.resetElectionTime()
 			go rf.electionTicker(rf.currentTerm)
 
-			rf.DPritf(dTimer, "lagging behind other peers, heartbeat abort, convert to follower\n")
+			rf.DPrintf(dTimer, "lagging behind other peers, heartbeat abort, convert to follower\n")
 
 			rf.persist()
 			return
 		}
 
-		rf.DPritf(dLeader, "receive heartbeat RPC reply from [%d], replyTerm: %d, replySuccess: %v, replyXterm: %d, replyXIndex: %d, replyXLen: %d\n", server, reply.Term, reply.Success, reply.XTerm, reply.XIndex, reply.XLen)
+		rf.DPrintf(dLeader, "receive heartbeat RPC reply from [%d], replyTerm: %d, replySuccess: %v, replyXterm: %d, replyXIndex: %d, replyXLen: %d\n", server, reply.Term, reply.Success, reply.XTerm, reply.XIndex, reply.XLen)
 
 		if reply.Term < rf.currentTerm {
-			rf.DPritf(dDrop, "reply from previous term, discard reply\n")
+			rf.DPrintf(dDrop, "reply from previous term, discard reply\n")
 			return
 		}
 
@@ -886,11 +891,11 @@ func (rf *Raft) sendAEtoPeer(server int, args *AppendEntriesArgs, savedLeaderHea
 					couldCommit := (rf.firstIndex != -1 && oldNextIndex >= rf.firstIndex)
 					rf.matchIndex[server] = newMatchIndex
 					rf.nextIndex[server] = newNextIndex
-					rf.DPritf(dLeader, "log entries {%d->%d} replicated to [%d] success\nfor follower[%d], newMatchIndex: %d, newNextIndex: %d\nCOULD COMMIT: %v\n", oldNextIndex, newMatchIndex, server, server, newMatchIndex, newNextIndex, couldCommit)
+					rf.DPrintf(dLeader, "log entries {%d->%d} replicated to [%d] success, for follower[%d], newMatchIndex: %d, newNextIndex: %d, COULD COMMIT: %v\n", oldNextIndex, newMatchIndex, server, server, newMatchIndex, newNextIndex, couldCommit)
 
 					// do increment commit
 					if couldCommit {
-						rf.DPritf(dLeader, "check if have some entries to commit, leaderCommitIndex: {%d}, leaderLastIndex: {%d}\n", rf.commitIndex, rf.getLastIndex())
+						rf.DPrintf(dLeader, "check if have some entries to commit, leaderCommitIndex: {%d}, leaderLastIndex: {%d}\n", rf.commitIndex, rf.getLastIndex())
 
 						doApply := false
 						savedCommitedIndex := rf.commitIndex
@@ -908,7 +913,7 @@ func (rf *Raft) sendAEtoPeer(server int, args *AppendEntriesArgs, savedLeaderHea
 									}
 									if matchCount*2 > len(rf.peers) {
 										rf.commitIndex = index
-										rf.DPritf(dCommit, "leader commitIndex {%d}\n", index)
+										rf.DPrintf(dCommit, "leader commitIndex {%d}\n", index)
 										doApply = true
 										break
 									}
@@ -924,6 +929,7 @@ func (rf *Raft) sendAEtoPeer(server int, args *AppendEntriesArgs, savedLeaderHea
 
 						if doApply {
 							for i := savedCommitedIndex + 1; i <= rf.commitIndex; i++ {
+								rf.DPrintf(dClient, "send applyMsg to service, commandIndex: %d\n", i)
 								rf.applyChan <- ApplyMsg{
 									CommandValid: true,
 									CommandIndex: i,
@@ -982,10 +988,10 @@ func (rf *Raft) sendAEtoPeer(server int, args *AppendEntriesArgs, savedLeaderHea
 			newArgs, doInstallSnapshot := rf.generateAEargs(server)
 			if doInstallSnapshot {
 				go rf.sendIStoPeer(server)
-				rf.DPritf(dLog2, "prevLog mismatch, send IS to [%d]\n", server)
+				rf.DPrintf(dLog2, "prevLog mismatch, send IS to [%d]\n", server)
 			} else {
 				go rf.sendAEtoPeer(server, newArgs, savedLeaderHeartbeatCount)
-				rf.DPritf(dLog2, "prevLog mismatch, send AE with nextIndex: {%d}\n", rf.nextIndex[server])
+				rf.DPrintf(dLog2, "prevLog mismatch, send AE with nextIndex: {%d}\n", rf.nextIndex[server])
 			}
 		}
 	}
@@ -998,7 +1004,7 @@ func (rf *Raft) sendAEtoPeer(server int, args *AppendEntriesArgs, savedLeaderHea
 // couldCommit only when triggered by Start()
 // to avoid helping commit logs belongs to former leaders
 func (rf *Raft) doHeartbeat() {
-	rf.DPritf(dLog, "begin sending heartbeat RPCs to followers\n")
+	rf.DPrintf(dLog, "begin sending heartbeat RPCs to followers\n")
 
 	rf.leaderHeartbeatCount += 1
 	for i := 0; i < len(rf.peers); i++ {
@@ -1007,14 +1013,14 @@ func (rf *Raft) doHeartbeat() {
 			args, doInstallSnapshot := rf.generateAEargs(i)
 			if doInstallSnapshot {
 				go rf.sendIStoPeer(i)
-				rf.DPritf(dLeader, "send InstallSnapshot RPC to [%d]\n", i)
+				rf.DPrintf(dLeader, "send InstallSnapshot RPC to [%d]\n", i)
 			} else {
 				go rf.sendAEtoPeer(i, args, rf.leaderHeartbeatCount)
-				rf.DPritf(dLeader, "send heartbeat RPC to [%d], LeaderTerm: %d, LeaderPrevLogIndex: %d, LeaderPrevLogTerm: %d, LeaderCommit: %d", i, args.LeaderTerm, args.LeaderPrevLogIndex, args.LeaderPrevLogTerm, args.LeaderCommit)
+				rf.DPrintf(dLeader, "send heartbeat RPC to [%d], LeaderTerm: %d, LeaderPrevLogIndex: %d, LeaderPrevLogTerm: %d, LeaderCommit: %d", i, args.LeaderTerm, args.LeaderPrevLogIndex, args.LeaderPrevLogTerm, args.LeaderCommit)
 				if args.LogEntries == nil {
-					rf.DPritf(dLeader, "without logs")
+					rf.DPrintf(dLeader, "without logs")
 				} else {
-					rf.DPritf(dLeader, "with logs: {%d->%d}\n", args.LeaderPrevLogIndex+1, args.LeaderPrevLogIndex+len(args.LogEntries))
+					rf.DPrintf(dLeader, "with logs: {%d->%d}\n", args.LeaderPrevLogIndex+1, args.LeaderPrevLogIndex+len(args.LogEntries))
 				}
 			}
 		}
@@ -1038,7 +1044,7 @@ func (rf *Raft) doElection(savedCandidateTerm int) {
 
 		rf.mu.RLock()
 		if rf.currentTerm != savedCandidateTerm || rf.status != CANDIDATE || electionDone {
-			rf.DPritf(dDrop, "election term_%d is no longer needed\n", savedCandidateTerm)
+			rf.DPrintf(dDrop, "election term_%d is no longer needed\n", savedCandidateTerm)
 			electionDone = true
 			rf.mu.RUnlock()
 			return
@@ -1055,7 +1061,7 @@ func (rf *Raft) doElection(savedCandidateTerm int) {
 					CandidateLastLogIndex: savedLastLogIndex,
 					CandidateLastLogTerm:  savedLastLogTerm,
 				}
-				rf.DPritf(dVote, "send RequestVote RPC to [%d]\n", i)
+				rf.DPrintf(dVote, "send RequestVote RPC to [%d]\n", i)
 
 				go func(server int) {
 					reply := &RequestVoteReply{}
@@ -1106,13 +1112,13 @@ func (rf *Raft) doElection(savedCandidateTerm int) {
 							rf.persist()
 							rf.resetElectionTime()
 							go rf.electionTicker(rf.currentTerm)
-							rf.DPritf(dDrop, "TERM lagging behind other peers, election abort, convert to follower of new term\n")
+							rf.DPrintf(dDrop, "TERM lagging behind other peers, election abort, convert to follower of new term\n")
 
 							electionDone = true
 							return
 						}
 
-						rf.DPritf(dVote, "receive RequestVote RPC reply from [%d], {%v}\n", server, reply)
+						rf.DPrintf(dVote, "receive RequestVote RPC reply from [%d], {%v}\n", server, reply)
 
 						if reply.VoteGranted {
 							voteReceived[server] = true
@@ -1124,10 +1130,10 @@ func (rf *Raft) doElection(savedCandidateTerm int) {
 								}
 							}
 
-							rf.DPritf(dVote, "vote granted from [%d], voteCount: %d/%d\n", server, voteCount, len(rf.peers))
+							rf.DPrintf(dVote, "vote granted from [%d], voteCount: %d/%d\n", server, voteCount, len(rf.peers))
 							if voteCount*2 > len(rf.peers) {
-								rf.DPritf(dVote, "won election\n")
-								rf.DPritf(dTimer, "heartbeat ticker begin\n")
+								rf.DPrintf(dVote, "won election\n")
+								rf.DPrintf(dTimer, "heartbeat ticker begin\n")
 
 								rf.setLeader()
 								go rf.heartbeatTicker(rf.currentTerm)
@@ -1142,14 +1148,14 @@ func (rf *Raft) doElection(savedCandidateTerm int) {
 							if reply.Status == LEADER {
 								rf.setFollower(rf.currentTerm, rf.me)
 								rf.resetElectionTime()
-								rf.DPritf(dDrop, "come across with valid leader, election abort, convert to follower\n")
+								rf.DPrintf(dDrop, "come across with valid leader, election abort, convert to follower\n")
 
 								electionDone = true
 								return
 							}
 
 							// no vote granted from peer because of lagging logs
-							rf.DPritf(dLog, "LOG lagging behind other peers or have voted to other candidates, no vote granted from [%d]\n", server)
+							rf.DPrintf(dLog, "LOG lagging behind other peers or have voted to other candidates, no vote granted from [%d]\n", server)
 						}
 					}
 				}(i)
@@ -1239,13 +1245,13 @@ func (rf *Raft) heartbeatTicker(savedHeartbeatTerm int) {
 		rf.mu.Lock()
 
 		if rf.currentTerm != savedHeartbeatTerm {
-			rf.DPritf(dTimer, "newer term detected heartbeat ticker term_%d abort\n", savedHeartbeatTerm)
+			rf.DPrintf(dTimer, "newer term detected heartbeat ticker term_%d abort\n", savedHeartbeatTerm)
 			rf.mu.Unlock()
 			return
 		}
 
 		if rf.status != LEADER {
-			rf.DPritf(dTimer, "no longer a leader, heartbeat ticker term_%d abort\n", savedHeartbeatTerm)
+			rf.DPrintf(dTimer, "no longer a leader, heartbeat ticker term_%d abort\n", savedHeartbeatTerm)
 			rf.mu.Unlock()
 			return
 		}
@@ -1279,27 +1285,27 @@ func (rf *Raft) electionTicker(savedElectionTerm int) {
 
 		// this election ticker is no longer needed
 		if rf.currentTerm != savedElectionTerm {
-			rf.DPritf(dTimer, "newer term detected election ticker term_%d abort\n", savedElectionTerm)
+			rf.DPrintf(dTimer, "newer term detected election ticker term_%d abort\n", savedElectionTerm)
 			rf.mu.Unlock()
 			return
 		}
 
 		// the leader would not start election
 		if rf.status == LEADER {
-			rf.DPritf(dTimer, "already a leader, election ticker term_%d abort\n", savedElectionTerm)
+			rf.DPrintf(dTimer, "already a leader, election ticker term_%d abort\n", savedElectionTerm)
 			rf.mu.Unlock()
 			return
 		}
 
 		// election timeout
 		if time.Now().After(rf.electionTime) {
-			rf.DPritf(dTimer, "election timeout, prepare to election\n")
+			rf.DPrintf(dTimer, "election timeout, prepare to election\n")
 
 			rf.setCandidate()
 			rf.resetElectionTime()
 			rf.persist()
 
-			rf.DPritf(dVote, "begin election\n")
+			rf.DPrintf(dVote, "begin election\n")
 			go rf.doElection(rf.currentTerm)
 
 			// begin a election timer of the new term
@@ -1322,7 +1328,7 @@ func (rf *Raft) resetHeartbeatTime() {
 func (rf *Raft) resetElectionTime() {
 	rf.electionTimeout = randomTimeout()
 	rf.electionTime = time.Now().Add(rf.electionTimeout)
-	rf.DPritf(dTimer, "election interval set to (%dms)\n", rf.electionTimeout.Milliseconds())
+	rf.DPrintf(dTimer, "election interval set to (%dms)\n", rf.electionTimeout.Milliseconds())
 }
 
 // generate a random time duration between 300ms and 500ms
@@ -1332,7 +1338,7 @@ func randomTimeout() time.Duration {
 
 // expect the caller to hold the read lock
 // debugging message formatter
-func (rf *Raft) DPritf(topic logTopic, format string, a ...interface{}) {
+func (rf *Raft) DPrintf(topic logTopic, format string, a ...interface{}) {
 	if DebugVerbosity >= 1 {
 		time := time.Since(DebugStart).Milliseconds()
 		time /= 100
@@ -1380,7 +1386,7 @@ func Make(
 
 	rf.resetElectionTime()
 	go rf.electionTicker(rf.currentTerm)
-	rf.DPritf(dTerm, "started\n")
+	rf.DPrintf(dTerm, "started\n")
 
 	return rf
 }
