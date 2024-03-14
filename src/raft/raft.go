@@ -130,7 +130,8 @@ func (rf *Raft) getSlicePosition(logicIndex int) int {
 }
 
 // expect the caller to hold the lock
-// TODO: maybe add rf.lastIndex field
+// IMPORTANT: try to add rf.lastIndex field instead of calculate it,
+// but the performance is 2 times slower than the original implementation
 func (rf *Raft) getLastIndex() int {
 	return len(rf.log) + rf.lastIncludedIndex
 }
@@ -281,19 +282,22 @@ func (rf *Raft) readPersist(state, snapshot []byte) {
 	// @Param snapshot is a copy from rf.persister
 	// so we can reference it safely
 	rf.snapshot = snapshot
+	rf.commitIndex = rf.lastIncludedIndex
 
-	// send snapshot to rf.applyChan in other goroutine
+	// send snapshot (if any) to rf.applyChan in other goroutine
 	// to avoid deadlock( Make() --> rf.readPersist() --> return rf --> setup rf.applyChan --> Make() )
-	go func() {
-		// everythin passed in a literal expression would be copy
-		rf.applyChan <- ApplyMsg{
-			CommandValid:  false,
-			SnapshotValid: true,
-			Snapshot:      snapshot,
-			SnapshotTerm:  rf.lastIncludedTerm,
-			SnapshotIndex: rf.lastIncludedIndex,
-		}
-	}()
+	if len(snapshot) != 0 {
+		go func() {
+			// everything passed in a literal expression would be copy
+			rf.applyChan <- ApplyMsg{
+				CommandValid:  false,
+				SnapshotValid: true,
+				Snapshot:      snapshot,
+				SnapshotTerm:  rf.lastIncludedTerm,
+				SnapshotIndex: rf.lastIncludedIndex,
+			}
+		}()
+	}
 
 	// elapsed := time.Since(start)
 	// test: the process of reading persist would take 1~3ms
@@ -347,8 +351,8 @@ type InstallSnapshotArgs struct {
 }
 
 type InstallSnapshotReply struct {
-	Term    int
-	Success bool
+	Term              int
+	FollowerLastIndex int
 }
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
@@ -359,7 +363,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	defer rf.mu.Unlock()
 
 	reply.Term = rf.currentTerm
-	reply.Success = false
 
 	rf.DPritf(dSnap, "receive InstallSnapshot RPC from leader [%d], args.LastIncludedTerm: %d, args.LastIncludedIndex: %d, args.LogEntriesLength: %d\n", args.LeaderID, args.LastIncludedTerm, args.LastIncludedIndex, len(args.LogEntries))
 
@@ -381,26 +384,31 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		reply.Term = rf.currentTerm
 	}
 
-	// TODO: handle unreliable
-	rf.snapshot = args.Snapshot
-	rf.lastIncludedTerm = args.LastIncludedTerm
-	rf.lastIncludedIndex = args.LastIncludedIndex
-	rf.commitIndex = args.LastIncludedIndex
+	myLastIndex, myLastTerm := rf.lastLogInfo()
+	if myLastTerm < args.LastIncludedIndex ||
+		(myLastTerm == args.LastIncludedTerm && myLastIndex <= args.LastIncludedIndex) {
+		rf.snapshot = args.Snapshot
+		rf.lastIncludedTerm = args.LastIncludedTerm
+		rf.lastIncludedIndex = args.LastIncludedIndex
+		rf.commitIndex = args.LastIncludedIndex
 
-	rf.log = []LogEntry{}
-	rf.log = append(rf.log, args.LogEntries...)
+		rf.log = []LogEntry{}
+		rf.log = append(rf.log, args.LogEntries...)
 
-	rf.applyChan <- ApplyMsg{
-		CommandValid:  false,
-		SnapshotValid: true,
-		Snapshot:      args.Snapshot,
-		SnapshotTerm:  args.LastIncludedTerm,
-		SnapshotIndex: args.LastIncludedIndex,
+		rf.applyChan <- ApplyMsg{
+			CommandValid:  false,
+			SnapshotValid: true,
+			Snapshot:      args.Snapshot,
+			SnapshotTerm:  args.LastIncludedTerm,
+			SnapshotIndex: args.LastIncludedIndex,
+		}
+
+		rf.DPritf(dSnap, "install snapshot success, myLastIncludedTerm: %d, myLastIncludedIndex: %d, myLastIndex: %d, myCommitIndex: %d\n", rf.lastIncludedTerm, rf.lastIncludedIndex, rf.getLastIndex(), rf.commitIndex)
+	} else {
+		rf.DPritf(dSnap, "I do have logs newer than args.LastIncludedIndex\n")
 	}
 
-	reply.Success = true
-
-	rf.DPritf(dSnap, "install snapshot success, myLastIncludedTerm: %d, myLastIncludedIndex: %d, myLastIndex: %d, myCommitIndex: %d\n", rf.lastIncludedTerm, rf.lastIncludedIndex, rf.getLastIndex(), rf.commitIndex)
+	reply.FollowerLastIndex = rf.getLastIndex()
 
 	if doPersist {
 		rf.persist()
@@ -448,16 +456,16 @@ func (rf *Raft) sendIStoPeer(server int) {
 			return
 		}
 
-		rf.DPritf(dSnap, "receive InstallSnapshot RPC reply from [%d], reply.Term: %d, reply.Success: %v\n", server, reply.Term, reply.Success)
+		rf.DPritf(dSnap, "receive InstallSnapshot RPC reply from [%d], reply.Term: %d, reply.Success: %v\n", server, reply.Term, reply.FollowerLastIndex)
 
 		if reply.Term < rf.currentTerm {
 			rf.DPritf(dDrop, "reply from previous term, discard reply\n")
 			return
 		}
 
-		if reply.Success {
-			rf.matchIndex[server] = args.LastIncludedIndex + len(args.LogEntries)
-			rf.nextIndex[server] = rf.matchIndex[server] + 1
+		if reply.FollowerLastIndex > rf.matchIndex[server] {
+			rf.matchIndex[server] = reply.FollowerLastIndex
+			rf.nextIndex[server] = reply.FollowerLastIndex + 1
 		}
 	}
 }
