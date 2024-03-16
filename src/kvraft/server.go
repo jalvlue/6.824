@@ -5,6 +5,7 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"6.5840/labgob"
 	"6.5840/labrpc"
@@ -32,6 +33,9 @@ type Op struct {
 	// for OpGet, len(Params) == 1, Params[0] == key
 	// for OpPutAppend, len(Params) == 2, Params[0] == key && Params[1] == value
 	Params []string
+
+	ClerkID   int64
+	RequestID int64
 }
 
 const (
@@ -41,7 +45,7 @@ const (
 )
 
 type KVServer struct {
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	me      int
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
@@ -62,23 +66,35 @@ type KVServer struct {
 	// process count the consumer(KVServer) has made
 	produceCount int
 	consumeCount int
+
+	// mapping: clerkID int64 -> KVServerExecutedResult string
+	clerkPrevRequestInfo map[int64]requestInfo
+}
+
+type requestInfo struct {
+	requestID int64
+	result    string
+}
+
+type requestIdentifier struct {
+	clerkID   int64
+	requestID int64
+	resultCh  chan string
 }
 
 // internal db operation
 // expect the caller to hold the lock
 func (kv *KVServer) get(key string) string {
 	value := kv.db[key]
-	kv.DPrintf("DB GET success, key: \"%v\", value: \"%v\"", key, value)
+	// kv.DPrintf("DB GET success, key: \"%v\", value: \"%v\"", key, value)
 	return value
 }
 
 // internal db operation
 // expect the caller to hold the lock
 func (kv *KVServer) put(key, value string) string {
-	var orig string
-	orig, kv.db[key] = kv.db[key], value
-
-	kv.DPrintf("DB PUT success, key: \"%v\", orig: \"%v\", value: \"%v\"", key, orig, value)
+	kv.db[key] = value
+	// kv.DPrintf("DB PUT success, key: \"%v\", orig: \"%v\", value: \"%v\"", key, orig, value)
 	return value
 }
 
@@ -89,19 +105,34 @@ func (kv *KVServer) append(key, valToAppend string) string {
 	value = value + valToAppend
 	kv.db[key] = value
 
-	kv.DPrintf("DB APPEND success, key: \"%v\", value: \"%v\"", key, value)
+	// kv.DPrintf("DB APPEND success, key: \"%v\", value: \"%v\"", key, value)
 	return value
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 
-	kv.DPrintf("receive GET RPC from clerk, args.Key: \"%v\"\n", args.Key)
+	kv.DPrintf("receive GET RPC from clerk [%v], args.RequestID: \"%v\", args.Key: \"%v\"\n", args.ClerkID, args.RequestID, args.Key)
+
+	kv.mu.RLock()
+	prevRequestInfo, ok := kv.clerkPrevRequestInfo[args.ClerkID]
+	if ok && args.RequestID == prevRequestInfo.requestID {
+		kv.mu.RUnlock()
+
+		reply.Err = OK
+		reply.Value = prevRequestInfo.result
+
+		kv.DPrintf("requestID: \"%v\" has been executed, retrieve result from previous request, GET Key: \"%v\", Value: \"%v\"\n", args.RequestID, args.Key, prevRequestInfo.result)
+		return
+	}
+	kv.mu.RUnlock()
 
 	index, _, isLeader := kv.rf.Start(
 		Op{
-			Type:   OpGet,
-			Params: []string{args.Key},
+			Type:      OpGet,
+			Params:    []string{args.Key},
+			ClerkID:   args.ClerkID,
+			RequestID: args.RequestID,
 		},
 	)
 	if !isLeader {
@@ -117,26 +148,59 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 	kv.DPrintf("raft agreement start, applyIndex: {%d}\n", index)
 
-	requestCh := make(chan string)
-	kv.requestMap.Store(index, requestCh)
+	// TODO: use clerkID -> channel mapping since a clerk would only launch one request at the same time
+	identifier := requestIdentifier{
+		clerkID:   args.ClerkID,
+		requestID: args.RequestID,
+		resultCh:  make(chan string),
+	}
+	kv.requestMap.Store(index, identifier)
 
-	res := <-requestCh
-	kv.requestMap.Delete(index)
+	select {
+	case res := <-identifier.resultCh:
+		{
+			kv.requestMap.Delete(index)
+			reply.Err = OK
+			reply.Value = res
+			kv.DPrintf("raft agreement finish, GET Key: \"%v\", Value: \"%v\"\n", args.Key, res)
+		}
+		// TODO: consider waiting timeout
+	case <-time.After(300 * time.Millisecond):
+		{
+			kv.requestMap.Delete(index)
+			reply.Err = ErrRepTimeout
+			kv.DPrintf("leader reply timeout, request fail\n")
 
-	reply.Err = OK
-	reply.Value = res
-	kv.DPrintf("raft agreement finish, GET Key: \"%v\", Value: \"%v\"\n", args.Key, res)
+			kv.mu.Lock()
+			kv.consumeCount += 1
+			kv.mu.Unlock()
+		}
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 
-	kv.DPrintf("receive PutAppend RPC, args.Key: \"%v\", args.Value: \"%v\", args.Op: \"%v\"\n", args.Key, args.Value, args.Op)
+	kv.DPrintf("receive PutAppend RPC from clerk [%v], args.RequestID: \"%v\", args.Key: \"%v\", args.Value: \"%v\", args.Op: \"%v\"\n", args.ClerkID, args.RequestID, args.Key, args.Value, args.Op)
+
+	kv.mu.RLock()
+	prevRequestInfo, ok := kv.clerkPrevRequestInfo[args.ClerkID]
+	if ok && args.RequestID == prevRequestInfo.requestID {
+		kv.mu.RUnlock()
+
+		reply.Err = OK
+
+		kv.DPrintf("retrieve executed result from lastRequestRes, PutAppend Key: \"%v\", Value: \"%v\"\n", args.Key, prevRequestInfo.result)
+		return
+	}
+	kv.mu.RUnlock()
 
 	index, _, isLeader := kv.rf.Start(
 		Op{
-			Type:   args.Op,
-			Params: []string{args.Key, args.Value},
+			Type:      args.Op,
+			Params:    []string{args.Key, args.Value},
+			ClerkID:   args.ClerkID,
+			RequestID: args.RequestID,
 		},
 	)
 	if !isLeader {
@@ -152,14 +216,31 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	kv.DPrintf("raft agreement start, applyIndex: {%d}\n", index)
 
-	requestCh := make(chan string)
-	kv.requestMap.Store(index, requestCh)
+	identifier := requestIdentifier{
+		clerkID:   args.ClerkID,
+		requestID: args.RequestID,
+		resultCh:  make(chan string),
+	}
+	kv.requestMap.Store(index, identifier)
 
-	res := <-requestCh
-	kv.requestMap.Delete(index)
+	select {
+	case res := <-identifier.resultCh:
+		{
+			kv.requestMap.Delete(index)
+			reply.Err = OK
+			kv.DPrintf("raft agreement finish, PutAppend Key: \"%v\", Value: \"%v\"\n", args.Key, res)
+		}
+	case <-time.After(300 * time.Millisecond):
+		{
+			kv.requestMap.Delete(index)
+			reply.Err = ErrRepTimeout
+			kv.DPrintf("leader reply timeout, request fail\n")
 
-	reply.Err = OK
-	kv.DPrintf("raft agreement finish, PutAppend key: \"%v\", value: \"%v\"\n", args.Key, res)
+			kv.mu.Lock()
+			kv.consumeCount += 1
+			kv.mu.Unlock()
+		}
+	}
 }
 
 func (kv *KVServer) handleApplyMsg() {
@@ -167,28 +248,38 @@ func (kv *KVServer) handleApplyMsg() {
 		// TODO: handle unreliable
 		applyMsg := <-kv.applyCh
 		{
+			kv.DPrintf("receive applyMsg, applyMsg.CommandIndex: %d\n", applyMsg.CommandIndex)
+
 			kv.mu.Lock()
+			if op, ok := applyMsg.Command.(Op); ok {
+				// consider okk && prevRequestInfo.requestID >= op.RequestID
+				if prevRequestInfo, okk := kv.clerkPrevRequestInfo[op.ClerkID]; !okk || op.RequestID > prevRequestInfo.requestID {
+					res := kv.doApply(&applyMsg, &op)
+					kv.clerkPrevRequestInfo[op.ClerkID] = requestInfo{
+						requestID: op.RequestID,
+						result:    res,
+					}
 
-			kv.DPrintf("receive applyMsg, applyMsg.Index: %d\n", applyMsg.CommandIndex)
-			res := kv.doApply(&applyMsg)
-
-			if requestToConsumeNum := kv.produceCount - kv.consumeCount; requestToConsumeNum > 0 {
-				kv.consumeCount += 1
-				requestCh, _ := kv.requestMap.Load(applyMsg.CommandIndex)
-				requestCh.(chan string) <- res
-			} else if requestToConsumeNum == 0 {
-				kv.produceCount = 0
-				kv.consumeCount = 0
+					if requestToConsumeNum := kv.produceCount - kv.consumeCount; requestToConsumeNum > 0 {
+						if entryVal, ok := kv.requestMap.Load(applyMsg.CommandIndex); ok {
+							if identifier, ok := entryVal.(requestIdentifier); ok && identifier.clerkID == op.ClerkID && identifier.requestID == op.RequestID {
+								kv.consumeCount += 1
+								identifier.resultCh <- res
+							}
+						}
+					} else if requestToConsumeNum == 0 {
+						kv.produceCount = 0
+						kv.consumeCount = 0
+					}
+				}
 			}
-
 			kv.mu.Unlock()
 		}
 	}
 }
 
-func (kv *KVServer) doApply(applyMsg *raft.ApplyMsg) string {
+func (kv *KVServer) doApply(applyMsg *raft.ApplyMsg, op *Op) string {
 	if applyMsg.CommandValid {
-		op := applyMsg.Command.(Op)
 		kv.DPrintf("apply applyMsg, applyMsg.Index: %d, applyMsg.Op: %v", applyMsg.CommandIndex, op)
 		if op.Type == OpGet {
 			return kv.get(op.Params[0])
@@ -253,6 +344,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.requestMap = sync.Map{}
 	kv.produceCount = 0
 	kv.consumeCount = 0
+	kv.clerkPrevRequestInfo = map[int64]requestInfo{}
 
 	kv.DPrintf("started")
 
