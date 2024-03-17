@@ -2,6 +2,7 @@ package kvraft
 
 import (
 	"crypto/rand"
+	"fmt"
 	"log"
 	"math/big"
 	"time"
@@ -17,7 +18,8 @@ const (
 // debugging printer
 func (ck *Clerk) DPrintf(format string, a ...interface{}) {
 	if Debug {
-		format = "CLRK " + format
+		prefix := fmt.Sprintf("CLRK [%v] ", ck.clerkId)
+		format = prefix + format
 		log.Printf(format, a...)
 	}
 }
@@ -30,6 +32,12 @@ type Clerk struct {
 
 	// ID of leader that clerk communicate successfully last time
 	lastLeaderID int64
+
+	// randomly generated ID for service to remember clerk
+	clerkId int64
+
+	// ID of last request
+	lastRequestID int64
 }
 
 func nrand() int64 {
@@ -46,8 +54,10 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 
 	ck.numServers = len(servers)
 	ck.lastLeaderID = ck.chooseRandomServerToSendRPC()
+	ck.clerkId = nrand()
+	ck.lastRequestID = int64(0)
 
-	ck.DPrintf("CLRK start\n")
+	ck.DPrintf("clerk start\n")
 	return ck
 }
 
@@ -70,23 +80,33 @@ func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
 
+	// TODO: maybe handle clerk agent for multiple concurrent clients
+	ck.lastRequestID += 1
+
 	reply := &GetReply{}
-	args := &GetArgs{key}
+	args := &GetArgs{
+		Key:       key,
+		ClerkID:   ck.clerkId,
+		RequestID: ck.lastRequestID,
+	}
 
 	leader := ck.lastLeaderID
 	for reply.Err != ErrNoKey {
-		ck.DPrintf("send GET RPC request to service, args.Key: \"%v\"\n", key)
+		ck.DPrintf("send GET RPC request to service, args.Key: \"%v\", args.RequestID: \"%v\"\n", key, args.RequestID)
 		if ok := ck.servers[leader].Call("KVServer.Get", args, reply); ok {
 			if reply.Err == OK {
-				ck.DPrintf("receive GET RPC response from service, Key: \"%v\", Value: \"%v\"\n", key, reply.Value)
+				ck.DPrintf("receive GET RPC response from service, args.RequestID: \"%v\", Key: \"%v\", Value: \"%v\"\n", args.RequestID, key, reply.Value)
 
 				ck.lastLeaderID = leader
 				return reply.Value
 			}
-		}
 
-		reply.Err = ErrDefault
-		time.Sleep(REQUEST_INTERVAL)
+			reply.Err = ErrDefault
+			time.Sleep(REQUEST_INTERVAL)
+		} else {
+			// leader crash or RPC message drop
+			ck.DPrintf("leader crashes or RPC message drop, do quickly resent\n")
+		}
 
 		leader = ck.chooseRandomServerToSendRPC()
 	}
@@ -105,29 +125,34 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
 
+	ck.lastRequestID += 1
+
 	reply := &PutAppendReply{}
 	args := &PutAppendArgs{
-		Key:   key,
-		Value: value,
-		Op:    op,
+		Key:       key,
+		Value:     value,
+		Op:        op,
+		ClerkID:   ck.clerkId,
+		RequestID: ck.lastRequestID,
 	}
 
 	leader := ck.lastLeaderID
-	// for err == ErrWrongLeader {
 	for {
-		ck.DPrintf("send PutAppend RPC request to service, args.Key: \"%v\", args.Value: \"%v\", args.Op: \"%v\"\n", key, value, op)
+		ck.DPrintf("send PutAppend RPC request to service, args.Key: \"%v\", args.Value: \"%v\", args.Op: \"%v\", args.RequestID: \"%v\"\n", key, value, op, args.RequestID)
 
 		if ok := ck.servers[leader].Call("KVServer.PutAppend", args, reply); ok {
 			if reply.Err == OK {
-				ck.DPrintf("receive PutAppend RPC response from srevice, PutAppend key: \"%v\", value: \"%v\" success\n", key, value)
+				ck.DPrintf("receive PutAppend RPC response from srevice, PutAppend Key: \"%v\", Value: \"%v\", args.RequestID: \"%v\" success\n", key, value, args.RequestID)
 
 				ck.lastLeaderID = leader
 				return
 			}
-		}
 
-		reply.Err = ErrDefault
-		time.Sleep(REQUEST_INTERVAL)
+			reply.Err = ErrDefault
+			time.Sleep(REQUEST_INTERVAL)
+		} else {
+			ck.DPrintf("leader crashes or RPC message drop, do quickly resent\n")
+		}
 
 		leader = ck.chooseRandomServerToSendRPC()
 	}

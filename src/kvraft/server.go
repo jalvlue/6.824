@@ -5,10 +5,16 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
+)
+
+const (
+	// longest time a clerk waiting for raft leader to reach agreement
+	CLERK_WAITING_TIMEOUT = 200 * time.Millisecond
 )
 
 // debugging printer
@@ -32,6 +38,9 @@ type Op struct {
 	// for OpGet, len(Params) == 1, Params[0] == key
 	// for OpPutAppend, len(Params) == 2, Params[0] == key && Params[1] == value
 	Params []string
+
+	ClerkID   int64
+	RequestID int64
 }
 
 const (
@@ -41,7 +50,7 @@ const (
 )
 
 type KVServer struct {
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	me      int
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
@@ -54,7 +63,7 @@ type KVServer struct {
 	// K/V database
 	db map[string]string
 
-	// mapping: raftCommandIndex int -> KVServerExecutedResult chan string
+	// mapping: raftCommandIndex int -> requestResultTransmitter
 	// for every clerk request to receive executed result
 	requestMap sync.Map
 
@@ -62,23 +71,44 @@ type KVServer struct {
 	// process count the consumer(KVServer) has made
 	produceCount int
 	consumeCount int
+
+	// mapping: clerkID int64 -> KVServerExecutedResult string
+	// for every clerk to check and retrieve previous executed result
+	clerkPrevRequestInfo map[int64]requestInfo
+
+	// mapping: clerkID int64 -> resultCh chan string
+	// for every clerk to transmit its request result
+	// instead of create a resultCh for every single request
+	clerkChMap map[int64]chan string
+}
+
+type requestInfo struct {
+	requestID int64
+	result    string
+}
+
+// passing executed result between kv.handleApplyMsg and kv.GET/PutAppend RPC through resultCh
+type requestResultTransmitter struct {
+	clerkID   int64
+	requestID int64
+
+	// reference to kv.clerkChMap[clerkID]
+	resultCh chan string
 }
 
 // internal db operation
 // expect the caller to hold the lock
 func (kv *KVServer) get(key string) string {
 	value := kv.db[key]
-	kv.DPrintf("DB GET success, key: \"%v\", value: \"%v\"", key, value)
+	// kv.DPrintf("DB GET success, key: \"%v\", value: \"%v\"", key, value)
 	return value
 }
 
 // internal db operation
 // expect the caller to hold the lock
 func (kv *KVServer) put(key, value string) string {
-	var orig string
-	orig, kv.db[key] = kv.db[key], value
-
-	kv.DPrintf("DB PUT success, key: \"%v\", orig: \"%v\", value: \"%v\"", key, orig, value)
+	kv.db[key] = value
+	// kv.DPrintf("DB PUT success, key: \"%v\", orig: \"%v\", value: \"%v\"", key, orig, value)
 	return value
 }
 
@@ -89,19 +119,34 @@ func (kv *KVServer) append(key, valToAppend string) string {
 	value = value + valToAppend
 	kv.db[key] = value
 
-	kv.DPrintf("DB APPEND success, key: \"%v\", value: \"%v\"", key, value)
+	// kv.DPrintf("DB APPEND success, key: \"%v\", value: \"%v\"", key, value)
 	return value
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 
-	kv.DPrintf("receive GET RPC from clerk, args.Key: \"%v\"\n", args.Key)
+	kv.DPrintf("receive GET RPC from clerk [%v], args.RequestID: \"%v\", args.Key: \"%v\"\n", args.ClerkID, args.RequestID, args.Key)
+
+	kv.mu.RLock()
+	prevRequestInfo, ok := kv.clerkPrevRequestInfo[args.ClerkID]
+	if ok && args.RequestID == prevRequestInfo.requestID {
+		kv.mu.RUnlock()
+
+		reply.Err = OK
+		reply.Value = prevRequestInfo.result
+
+		kv.DPrintf("requestID: \"%v\" has been executed, retrieve result from previous request, GET Key: \"%v\", Value: \"%v\"\n", args.RequestID, args.Key, prevRequestInfo.result)
+		return
+	}
+	kv.mu.RUnlock()
 
 	index, _, isLeader := kv.rf.Start(
 		Op{
-			Type:   OpGet,
-			Params: []string{args.Key},
+			Type:      OpGet,
+			Params:    []string{args.Key},
+			ClerkID:   args.ClerkID,
+			RequestID: args.RequestID,
 		},
 	)
 	if !isLeader {
@@ -113,82 +158,151 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// atomic.AddInt64(&kv.produceCount, int64(1))
 	kv.mu.Lock()
 	kv.produceCount += 1
-	kv.mu.Unlock()
-
-	kv.DPrintf("raft agreement start, applyIndex: {%d}\n", index)
-
-	requestCh := make(chan string)
-	kv.requestMap.Store(index, requestCh)
-
-	res := <-requestCh
-	kv.requestMap.Delete(index)
-
-	reply.Err = OK
-	reply.Value = res
-	kv.DPrintf("raft agreement finish, GET Key: \"%v\", Value: \"%v\"\n", args.Key, res)
-}
-
-func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
-
-	kv.DPrintf("receive PutAppend RPC, args.Key: \"%v\", args.Value: \"%v\", args.Op: \"%v\"\n", args.Key, args.Value, args.Op)
-
-	index, _, isLeader := kv.rf.Start(
-		Op{
-			Type:   args.Op,
-			Params: []string{args.Key, args.Value},
-		},
-	)
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-		kv.DPrintf("I am not leader, return with ErrWrongLeader\n")
-		return
+	resultCh, ok := kv.clerkChMap[args.ClerkID]
+	if !ok {
+		resultCh = make(chan string)
+		kv.clerkChMap[args.ClerkID] = resultCh
 	}
-
-	// atomic.AddInt64(&kv.produceCount, int64(1))
-	kv.mu.Lock()
-	kv.produceCount += 1
 	kv.mu.Unlock()
 
 	kv.DPrintf("raft agreement start, applyIndex: {%d}\n", index)
 
-	requestCh := make(chan string)
-	kv.requestMap.Store(index, requestCh)
+	// TODO DONE, proof to be tough: use clerkID -> channel mapping since a clerk would only launch one request at the same time
 
-	res := <-requestCh
-	kv.requestMap.Delete(index)
+	receiver := requestResultTransmitter{
+		clerkID:   args.ClerkID,
+		requestID: args.RequestID,
+		resultCh:  resultCh,
+	}
+	kv.requestMap.Store(index, receiver)
 
-	reply.Err = OK
-	kv.DPrintf("raft agreement finish, PutAppend key: \"%v\", value: \"%v\"\n", args.Key, res)
-}
-
-func (kv *KVServer) handleApplyMsg() {
-	for !kv.killed() {
-		// TODO: handle unreliable
-		applyMsg := <-kv.applyCh
+	select {
+	case res := <-receiver.resultCh:
 		{
+			kv.requestMap.Delete(index)
+			reply.Err = OK
+			reply.Value = res
+			kv.DPrintf("raft agreement finish, GET Key: \"%v\", Value: \"%v\"\n", args.Key, res)
+		}
+	case <-time.After(CLERK_WAITING_TIMEOUT):
+		{
+			kv.requestMap.Delete(index)
+			reply.Err = ErrRepTimeout
+			kv.DPrintf("leader reply timeout, request fail\n")
+
 			kv.mu.Lock()
-
-			kv.DPrintf("receive applyMsg, applyMsg.Index: %d\n", applyMsg.CommandIndex)
-			res := kv.doApply(&applyMsg)
-
-			if requestToConsumeNum := kv.produceCount - kv.consumeCount; requestToConsumeNum > 0 {
-				kv.consumeCount += 1
-				requestCh, _ := kv.requestMap.Load(applyMsg.CommandIndex)
-				requestCh.(chan string) <- res
-			} else if requestToConsumeNum == 0 {
-				kv.produceCount = 0
-				kv.consumeCount = 0
-			}
-
+			kv.consumeCount += 1
 			kv.mu.Unlock()
 		}
 	}
 }
 
-func (kv *KVServer) doApply(applyMsg *raft.ApplyMsg) string {
+func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+	// Your code here.
+
+	kv.DPrintf("receive PutAppend RPC from clerk [%v], args.RequestID: \"%v\", args.Key: \"%v\", args.Value: \"%v\", args.Op: \"%v\"\n", args.ClerkID, args.RequestID, args.Key, args.Value, args.Op)
+
+	kv.mu.RLock()
+	prevRequestInfo, ok := kv.clerkPrevRequestInfo[args.ClerkID]
+	if ok && args.RequestID == prevRequestInfo.requestID {
+		kv.mu.RUnlock()
+
+		reply.Err = OK
+
+		kv.DPrintf("retrieve executed result from lastRequestRes, PutAppend Key: \"%v\", Value: \"%v\"\n", args.Key, prevRequestInfo.result)
+		return
+	}
+	kv.mu.RUnlock()
+
+	index, _, isLeader := kv.rf.Start(
+		Op{
+			Type:      args.Op,
+			Params:    []string{args.Key, args.Value},
+			ClerkID:   args.ClerkID,
+			RequestID: args.RequestID,
+		},
+	)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		kv.DPrintf("I am not leader, return with ErrWrongLeader\n")
+		return
+	}
+
+	// atomic.AddInt64(&kv.produceCount, int64(1))
+	kv.mu.Lock()
+	kv.produceCount += 1
+
+	resultCh, ok := kv.clerkChMap[args.ClerkID]
+	if !ok {
+		resultCh = make(chan string)
+		kv.clerkChMap[args.ClerkID] = resultCh
+	}
+	kv.mu.Unlock()
+
+	kv.DPrintf("raft agreement start, applyIndex: {%d}\n", index)
+
+	receiver := requestResultTransmitter{
+		clerkID:   args.ClerkID,
+		requestID: args.RequestID,
+		resultCh:  resultCh,
+	}
+	kv.requestMap.Store(index, receiver)
+
+	select {
+	case res := <-receiver.resultCh:
+		{
+			kv.requestMap.Delete(index)
+			reply.Err = OK
+			kv.DPrintf("raft agreement finish, PutAppend Key: \"%v\", Value: \"%v\"\n", args.Key, res)
+		}
+	case <-time.After(300 * time.Millisecond):
+		{
+			kv.requestMap.Delete(index)
+			reply.Err = ErrRepTimeout
+			kv.DPrintf("leader reply timeout, request fail\n")
+
+			kv.mu.Lock()
+			kv.consumeCount += 1
+			kv.mu.Unlock()
+		}
+	}
+}
+
+func (kv *KVServer) handleApplyMsg() {
+	for !kv.killed() {
+		applyMsg := <-kv.applyCh
+		{
+			kv.DPrintf("receive applyMsg, applyMsg.CommandIndex: %d\n", applyMsg.CommandIndex)
+
+			kv.mu.Lock()
+			if op, ok := applyMsg.Command.(Op); ok {
+				if prevRequestInfo, okk := kv.clerkPrevRequestInfo[op.ClerkID]; !okk || op.RequestID > prevRequestInfo.requestID {
+					res := kv.doApply(&applyMsg, &op)
+					kv.clerkPrevRequestInfo[op.ClerkID] = requestInfo{
+						requestID: op.RequestID,
+						result:    res,
+					}
+
+					if requestToConsumeNum := kv.produceCount - kv.consumeCount; requestToConsumeNum > 0 {
+						if entryVal, okkk := kv.requestMap.Load(applyMsg.CommandIndex); okkk {
+							if sender, ok := entryVal.(requestResultTransmitter); ok && sender.clerkID == op.ClerkID && sender.requestID == op.RequestID {
+								kv.consumeCount += 1
+								sender.resultCh <- res
+							}
+						}
+					} else if requestToConsumeNum == 0 {
+						kv.produceCount = 0
+						kv.consumeCount = 0
+					}
+				}
+			}
+			kv.mu.Unlock()
+		}
+	}
+}
+
+func (kv *KVServer) doApply(applyMsg *raft.ApplyMsg, op *Op) string {
 	if applyMsg.CommandValid {
-		op := applyMsg.Command.(Op)
 		kv.DPrintf("apply applyMsg, applyMsg.Index: %d, applyMsg.Op: %v", applyMsg.CommandIndex, op)
 		if op.Type == OpGet {
 			return kv.get(op.Params[0])
@@ -253,6 +367,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.requestMap = sync.Map{}
 	kv.produceCount = 0
 	kv.consumeCount = 0
+	kv.clerkPrevRequestInfo = map[int64]requestInfo{}
+	kv.clerkChMap = map[int64]chan string{}
 
 	kv.DPrintf("started")
 
