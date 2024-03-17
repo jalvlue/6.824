@@ -12,6 +12,11 @@ import (
 	"6.5840/raft"
 )
 
+const (
+	// longest time a clerk waiting for raft leader to reach agreement
+	CLERK_WAITING_TIMEOUT = 200 * time.Millisecond
+)
+
 // debugging printer
 func (kv *KVServer) DPrintf(format string, a ...interface{}) {
 	if Debug {
@@ -58,7 +63,7 @@ type KVServer struct {
 	// K/V database
 	db map[string]string
 
-	// mapping: raftCommandIndex int -> KVServerExecutedResult chan string
+	// mapping: raftCommandIndex int -> requestResultTransmitter
 	// for every clerk request to receive executed result
 	requestMap sync.Map
 
@@ -68,7 +73,13 @@ type KVServer struct {
 	consumeCount int
 
 	// mapping: clerkID int64 -> KVServerExecutedResult string
+	// for every clerk to check and retrieve previous executed result
 	clerkPrevRequestInfo map[int64]requestInfo
+
+	// mapping: clerkID int64 -> resultCh chan string
+	// for every clerk to transmit its request result
+	// instead of create a resultCh for every single request
+	clerkChMap map[int64]chan string
 }
 
 type requestInfo struct {
@@ -76,10 +87,13 @@ type requestInfo struct {
 	result    string
 }
 
-type requestIdentifier struct {
+// passing executed result between kv.handleApplyMsg and kv.GET/PutAppend RPC through resultCh
+type requestResultTransmitter struct {
 	clerkID   int64
 	requestID int64
-	resultCh  chan string
+
+	// reference to kv.clerkChMap[clerkID]
+	resultCh chan string
 }
 
 // internal db operation
@@ -144,28 +158,33 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// atomic.AddInt64(&kv.produceCount, int64(1))
 	kv.mu.Lock()
 	kv.produceCount += 1
+	resultCh, ok := kv.clerkChMap[args.ClerkID]
+	if !ok {
+		resultCh = make(chan string)
+		kv.clerkChMap[args.ClerkID] = resultCh
+	}
 	kv.mu.Unlock()
 
 	kv.DPrintf("raft agreement start, applyIndex: {%d}\n", index)
 
-	// TODO: use clerkID -> channel mapping since a clerk would only launch one request at the same time
-	identifier := requestIdentifier{
+	// TODO DONE, proof to be tough: use clerkID -> channel mapping since a clerk would only launch one request at the same time
+
+	receiver := requestResultTransmitter{
 		clerkID:   args.ClerkID,
 		requestID: args.RequestID,
-		resultCh:  make(chan string),
+		resultCh:  resultCh,
 	}
-	kv.requestMap.Store(index, identifier)
+	kv.requestMap.Store(index, receiver)
 
 	select {
-	case res := <-identifier.resultCh:
+	case res := <-receiver.resultCh:
 		{
 			kv.requestMap.Delete(index)
 			reply.Err = OK
 			reply.Value = res
 			kv.DPrintf("raft agreement finish, GET Key: \"%v\", Value: \"%v\"\n", args.Key, res)
 		}
-		// TODO: consider waiting timeout
-	case <-time.After(300 * time.Millisecond):
+	case <-time.After(CLERK_WAITING_TIMEOUT):
 		{
 			kv.requestMap.Delete(index)
 			reply.Err = ErrRepTimeout
@@ -212,19 +231,25 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// atomic.AddInt64(&kv.produceCount, int64(1))
 	kv.mu.Lock()
 	kv.produceCount += 1
+
+	resultCh, ok := kv.clerkChMap[args.ClerkID]
+	if !ok {
+		resultCh = make(chan string)
+		kv.clerkChMap[args.ClerkID] = resultCh
+	}
 	kv.mu.Unlock()
 
 	kv.DPrintf("raft agreement start, applyIndex: {%d}\n", index)
 
-	identifier := requestIdentifier{
+	receiver := requestResultTransmitter{
 		clerkID:   args.ClerkID,
 		requestID: args.RequestID,
-		resultCh:  make(chan string),
+		resultCh:  resultCh,
 	}
-	kv.requestMap.Store(index, identifier)
+	kv.requestMap.Store(index, receiver)
 
 	select {
-	case res := <-identifier.resultCh:
+	case res := <-receiver.resultCh:
 		{
 			kv.requestMap.Delete(index)
 			reply.Err = OK
@@ -245,14 +270,12 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 func (kv *KVServer) handleApplyMsg() {
 	for !kv.killed() {
-		// TODO: handle unreliable
 		applyMsg := <-kv.applyCh
 		{
 			kv.DPrintf("receive applyMsg, applyMsg.CommandIndex: %d\n", applyMsg.CommandIndex)
 
 			kv.mu.Lock()
 			if op, ok := applyMsg.Command.(Op); ok {
-				// consider okk && prevRequestInfo.requestID >= op.RequestID
 				if prevRequestInfo, okk := kv.clerkPrevRequestInfo[op.ClerkID]; !okk || op.RequestID > prevRequestInfo.requestID {
 					res := kv.doApply(&applyMsg, &op)
 					kv.clerkPrevRequestInfo[op.ClerkID] = requestInfo{
@@ -261,10 +284,10 @@ func (kv *KVServer) handleApplyMsg() {
 					}
 
 					if requestToConsumeNum := kv.produceCount - kv.consumeCount; requestToConsumeNum > 0 {
-						if entryVal, ok := kv.requestMap.Load(applyMsg.CommandIndex); ok {
-							if identifier, ok := entryVal.(requestIdentifier); ok && identifier.clerkID == op.ClerkID && identifier.requestID == op.RequestID {
+						if entryVal, okkk := kv.requestMap.Load(applyMsg.CommandIndex); okkk {
+							if sender, ok := entryVal.(requestResultTransmitter); ok && sender.clerkID == op.ClerkID && sender.requestID == op.RequestID {
 								kv.consumeCount += 1
-								identifier.resultCh <- res
+								sender.resultCh <- res
 							}
 						}
 					} else if requestToConsumeNum == 0 {
@@ -345,6 +368,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.produceCount = 0
 	kv.consumeCount = 0
 	kv.clerkPrevRequestInfo = map[int64]requestInfo{}
+	kv.clerkChMap = map[int64]chan string{}
 
 	kv.DPrintf("started")
 
