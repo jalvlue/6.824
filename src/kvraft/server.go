@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"sync"
@@ -60,6 +61,9 @@ type KVServer struct {
 
 	// Your definitions here.
 
+	// persister of this KVServer and its raft component
+	persister *raft.Persister
+
 	// K/V database
 	db map[string]string
 
@@ -82,9 +86,11 @@ type KVServer struct {
 	clerkChMap map[int64]chan string
 }
 
+// id and result of last request the clerk made
+// for duplicated operations detection
 type requestInfo struct {
-	requestID int64
-	result    string
+	RequestID int64
+	Result    string
 }
 
 // passing executed result between kv.handleApplyMsg and kv.GET/PutAppend RPC through resultCh
@@ -130,13 +136,13 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 	kv.mu.RLock()
 	prevRequestInfo, ok := kv.clerkPrevRequestInfo[args.ClerkID]
-	if ok && args.RequestID == prevRequestInfo.requestID {
+	if ok && args.RequestID == prevRequestInfo.RequestID {
 		kv.mu.RUnlock()
 
 		reply.Err = OK
-		reply.Value = prevRequestInfo.result
+		reply.Value = prevRequestInfo.Result
 
-		kv.DPrintf("requestID: \"%v\" has been executed, retrieve result from previous request, GET Key: \"%v\", Value: \"%v\"\n", args.RequestID, args.Key, prevRequestInfo.result)
+		kv.DPrintf("requestID: \"%v\" has been executed, retrieve result from previous request, GET Key: \"%v\", Value: \"%v\"\n", args.RequestID, args.Key, prevRequestInfo.Result)
 		return
 	}
 	kv.mu.RUnlock()
@@ -204,12 +210,12 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	kv.mu.RLock()
 	prevRequestInfo, ok := kv.clerkPrevRequestInfo[args.ClerkID]
-	if ok && args.RequestID == prevRequestInfo.requestID {
+	if ok && args.RequestID == prevRequestInfo.RequestID {
 		kv.mu.RUnlock()
 
 		reply.Err = OK
 
-		kv.DPrintf("retrieve executed result from lastRequestRes, PutAppend Key: \"%v\", Value: \"%v\"\n", args.Key, prevRequestInfo.result)
+		kv.DPrintf("retrieve executed result from lastRequestRes, PutAppend Key: \"%v\", Value: \"%v\"\n", args.Key, prevRequestInfo.Result)
 		return
 	}
 	kv.mu.RUnlock()
@@ -268,52 +274,115 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 }
 
+// long-running listen to raft message from applyCh
 func (kv *KVServer) handleApplyMsg() {
 	for !kv.killed() {
 		applyMsg := <-kv.applyCh
 		{
-			kv.DPrintf("receive applyMsg, applyMsg.CommandIndex: %d\n", applyMsg.CommandIndex)
+			if applyMsg.CommandValid {
+				// command msg
+				kv.DPrintf("receive command commit applyMsg, applyMsg.CommandIndex: %d\n", applyMsg.CommandIndex)
 
-			kv.mu.Lock()
-			if op, ok := applyMsg.Command.(Op); ok {
-				if prevRequestInfo, okk := kv.clerkPrevRequestInfo[op.ClerkID]; !okk || op.RequestID > prevRequestInfo.requestID {
-					res := kv.doApply(&applyMsg, &op)
-					kv.clerkPrevRequestInfo[op.ClerkID] = requestInfo{
-						requestID: op.RequestID,
-						result:    res,
+				kv.mu.Lock()
+				if op, ok := applyMsg.Command.(Op); ok {
+					// check and apply command
+					if prevRequestInfo, okk := kv.clerkPrevRequestInfo[op.ClerkID]; !okk || op.RequestID > prevRequestInfo.RequestID {
+						res := kv.applyCommand(&applyMsg, &op)
+						kv.clerkPrevRequestInfo[op.ClerkID] = requestInfo{
+							RequestID: op.RequestID,
+							Result:    res,
+						}
+
+						// check and send executed result back to request
+						if requestToConsumeNum := kv.produceCount - kv.consumeCount; requestToConsumeNum > 0 {
+							if entryVal, okkk := kv.requestMap.Load(applyMsg.CommandIndex); okkk {
+								if sender, ok := entryVal.(requestResultTransmitter); ok && sender.clerkID == op.ClerkID && sender.requestID == op.RequestID {
+									kv.consumeCount += 1
+									sender.resultCh <- res
+								}
+							}
+						} else if requestToConsumeNum == 0 {
+							kv.produceCount = 0
+							kv.consumeCount = 0
+						}
 					}
 
-					if requestToConsumeNum := kv.produceCount - kv.consumeCount; requestToConsumeNum > 0 {
-						if entryVal, okkk := kv.requestMap.Load(applyMsg.CommandIndex); okkk {
-							if sender, ok := entryVal.(requestResultTransmitter); ok && sender.clerkID == op.ClerkID && sender.requestID == op.RequestID {
-								kv.consumeCount += 1
-								sender.resultCh <- res
-							}
-						}
-					} else if requestToConsumeNum == 0 {
-						kv.produceCount = 0
-						kv.consumeCount = 0
+					// kv.maxraftstate = -1 for no snapshot option
+					// raft state out of bound, do a snapshot
+					if kv.maxraftstate > 0 && kv.maxraftstate < kv.persister.RaftStateSize() {
+						kv.DPrintf("persister state is approaching kv.maxraftstate, snapshot created and sent to raft\n")
+						kv.rf.Snapshot(applyMsg.CommandIndex, kv.generateSnapshot())
 					}
 				}
+				kv.mu.Unlock()
+
+			} else if applyMsg.SnapshotValid {
+				// snapshot msg
+				kv.DPrintf("receive snapshot applyMsg, applyMsg.SnapshotTerm: %d, applyMsg.SnapshotIndex\n", applyMsg.SnapshotTerm, applyMsg.SnapshotIndex)
+
+				kv.mu.Lock()
+				kv.applySnapshot(applyMsg.Snapshot)
+				kv.mu.Unlock()
+
+				kv.DPrintf("read and apply snapshot success\n")
 			}
-			kv.mu.Unlock()
 		}
 	}
 }
 
-func (kv *KVServer) doApply(applyMsg *raft.ApplyMsg, op *Op) string {
-	if applyMsg.CommandValid {
-		kv.DPrintf("apply applyMsg, applyMsg.Index: %d, applyMsg.Op: %v", applyMsg.CommandIndex, op)
-		if op.Type == OpGet {
-			return kv.get(op.Params[0])
-		} else if op.Type == OpPut {
-			return kv.put(op.Params[0], op.Params[1])
-		} else {
-			return kv.append(op.Params[0], op.Params[1])
-		}
+// expect the caller to hold the lock
+// executed internal db operations
+func (kv *KVServer) applyCommand(applyMsg *raft.ApplyMsg, op *Op) string {
+	kv.DPrintf("apply command commit applyMsg, applyMsg.Index: %d, applyMsg.Op: %v", applyMsg.CommandIndex, op)
+	if op.Type == OpGet {
+		return kv.get(op.Params[0])
+	} else if op.Type == OpPut {
+		return kv.put(op.Params[0], op.Params[1])
+	} else {
+		return kv.append(op.Params[0], op.Params[1])
+	}
+}
+
+type KVSnapshot struct {
+	DB                   map[string]string
+	ClerkPrevRequestInfo map[int64]requestInfo
+}
+
+// expect the caller to hold the lock
+// generate a snapshot of server storage: kv.db
+// and detect duplicated operations state: kv.clerkPrevRequestInfo
+func (kv *KVServer) generateSnapshot() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	snapshot := KVSnapshot{
+		DB:                   kv.db,
+		ClerkPrevRequestInfo: kv.clerkPrevRequestInfo,
 	}
 
-	return ""
+	if err := e.Encode(snapshot); err != nil {
+		panic(fmt.Errorf("snapshot encode fail: %w", err))
+	}
+
+	return w.Bytes()
+}
+
+// expect the caller to hold the lock
+// read and apply snapshot to restore state
+func (kv *KVServer) applySnapshot(snapshotBytes []byte) {
+	r := bytes.NewBuffer(snapshotBytes)
+	d := labgob.NewDecoder(r)
+
+	var snapshot KVSnapshot
+
+	if err := d.Decode(&snapshot); err != nil {
+		panic(fmt.Errorf("snapshot decode fail: %w", err))
+	} else {
+		// raft would pass a copy of its snap through applyCh
+		// so we can reference to it safely
+		kv.db = snapshot.DB
+		kv.clerkPrevRequestInfo = snapshot.ClerkPrevRequestInfo
+	}
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -358,11 +427,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 
-	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-
-	// You may need initialization code here.
-
 	kv.db = map[string]string{}
 	kv.requestMap = sync.Map{}
 	kv.produceCount = 0
@@ -370,9 +434,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.clerkPrevRequestInfo = map[int64]requestInfo{}
 	kv.clerkChMap = map[int64]chan string{}
 
-	kv.DPrintf("started")
-
+	kv.persister = persister
+	kv.applyCh = make(chan raft.ApplyMsg)
 	go kv.handleApplyMsg()
+
+	// You may need initialization code here.
+
+	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+
+	kv.DPrintf("started")
 
 	return kv
 }
