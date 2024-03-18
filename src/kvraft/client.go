@@ -18,7 +18,7 @@ const (
 // debugging printer
 func (ck *Clerk) DPrintf(format string, a ...interface{}) {
 	if Debug {
-		prefix := fmt.Sprintf("CLRK [%v] ", ck.clerkId)
+		prefix := fmt.Sprintf("CLRK [%v] ", ck.clerkID)
 		format = prefix + format
 		log.Printf(format, a...)
 	}
@@ -34,7 +34,7 @@ type Clerk struct {
 	lastLeaderID int64
 
 	// randomly generated ID for service to remember clerk
-	clerkId int64
+	clerkID int64
 
 	// ID of last request
 	lastRequestID int64
@@ -54,8 +54,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 
 	ck.numServers = len(servers)
 	ck.lastLeaderID = ck.chooseRandomServerToSendRPC()
-	ck.clerkId = nrand()
-	ck.lastRequestID = int64(0)
+	ck.clerkID = nrand()
+	ck.lastRequestID = 0
 
 	ck.DPrintf("clerk start\n")
 	return ck
@@ -86,7 +86,7 @@ func (ck *Clerk) Get(key string) string {
 	reply := &GetReply{}
 	args := &GetArgs{
 		Key:       key,
-		ClerkID:   ck.clerkId,
+		ClerkID:   ck.clerkID,
 		RequestID: ck.lastRequestID,
 	}
 
@@ -132,7 +132,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		Key:       key,
 		Value:     value,
 		Op:        op,
-		ClerkID:   ck.clerkId,
+		ClerkID:   ck.clerkID,
 		RequestID: ck.lastRequestID,
 	}
 

@@ -318,7 +318,7 @@ func (kv *KVServer) handleApplyMsg() {
 
 			} else if applyMsg.SnapshotValid {
 				// snapshot msg
-				kv.DPrintf("receive snapshot applyMsg, applyMsg.SnapshotTerm: %d, applyMsg.SnapshotIndex\n", applyMsg.SnapshotTerm, applyMsg.SnapshotIndex)
+				kv.DPrintf("receive snapshot applyMsg, applyMsg.SnapshotTerm: %d, applyMsg.SnapshotIndex: %d\n", applyMsg.SnapshotTerm, applyMsg.SnapshotIndex)
 
 				kv.mu.Lock()
 				kv.applySnapshot(applyMsg.Snapshot)

@@ -390,8 +390,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 
 	myLastIndex, myLastTerm := rf.lastLogInfo()
-	if myLastTerm < args.LastIncludedIndex ||
-		(myLastTerm == args.LastIncludedTerm && myLastIndex <= args.LastIncludedIndex) {
+	rf.DPrintf(dSnap, "myLastIndex: %d, myLastTerm: %d\n", myLastIndex, myLastTerm)
+	if myLastTerm < args.LastIncludedTerm ||
+		(myLastTerm == args.LastIncludedTerm && myLastIndex < args.LastIncludedIndex) {
 		rf.snapshot = args.Snapshot
 		rf.lastIncludedTerm = args.LastIncludedTerm
 		rf.lastIncludedIndex = args.LastIncludedIndex
@@ -399,6 +400,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 		rf.log = []LogEntry{}
 		rf.log = append(rf.log, args.LogEntries...)
+
+		doPersist = true
 
 		rf.applyChan <- ApplyMsg{
 			CommandValid:  false,
@@ -411,6 +414,18 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.DPrintf(dSnap, "install snapshot success, myLastIncludedTerm: %d, myLastIncludedIndex: %d, myLastIndex: %d, myCommitIndex: %d\n", rf.lastIncludedTerm, rf.lastIncludedIndex, rf.getLastIndex(), rf.commitIndex)
 	} else {
 		rf.DPrintf(dSnap, "I do have logs newer than args.LastIncludedIndex\n")
+		if myLastIndex < (args.LastIncludedIndex + len(args.LogEntries)) {
+			if rf.lastIncludedIndex < args.LastIncludedIndex {
+				rf.log = rf.log[0 : rf.getSlicePosition(args.LastIncludedIndex)+1]
+				rf.log = append(rf.log, args.LogEntries...)
+			} else {
+				rf.log = []LogEntry{}
+				rf.log = append(rf.log, args.LogEntries[rf.lastIncludedIndex-args.LastIncludedIndex:]...)
+			}
+
+			doPersist = true
+			rf.DPrintf(dSnap, "copy logEntries success, myLastIndex: %d\n", args.LastIncludedIndex+len(args.LogEntries))
+		}
 	}
 
 	reply.FollowerLastIndex = rf.getLastIndex()
@@ -461,7 +476,7 @@ func (rf *Raft) sendIStoPeer(server int) {
 			return
 		}
 
-		rf.DPrintf(dSnap, "receive InstallSnapshot RPC reply from [%d], reply.Term: %d, reply.Success: %v\n", server, reply.Term, reply.FollowerLastIndex)
+		rf.DPrintf(dSnap, "receive InstallSnapshot RPC reply from [%d], reply.Term: %d, reply.FollowerLastIndex: %v\n", server, reply.Term, reply.FollowerLastIndex)
 
 		if reply.Term < rf.currentTerm {
 			rf.DPrintf(dDrop, "reply from previous term, discard reply\n")
@@ -902,7 +917,7 @@ func (rf *Raft) sendAEtoPeer(server int, args *AppendEntriesArgs, savedLeaderHea
 						if savedCommitedIndex < newMatchIndex {
 
 							index := oldNextIndex
-							if savedCommitedIndex > index {
+							if savedCommitedIndex >= index {
 								index = savedCommitedIndex + 1
 							}
 							for ; index <= rf.getLastIndex(); index++ {
