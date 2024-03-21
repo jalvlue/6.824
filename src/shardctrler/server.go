@@ -96,6 +96,7 @@ func (sc *ShardCtrler) copyConfig(cfg *Config) Config {
 	cpy := Config{
 		Num:    cfg.Num,
 		Shards: cfg.Shards,
+		Groups: map[int][]string{},
 	}
 
 	for k, v := range cfg.Groups {
@@ -454,9 +455,12 @@ func (sc *ShardCtrler) reassignGroupJoin(shards *[NShards]int, newGroups, oldGro
 	numNewGroup := len(newGroups)
 	numOldGroups := len(oldGroups)
 
-	numAvailableGroups := float32(numNewGroup + numOldGroups)
-	shardTasks := float32(NShards)
+	numAvailableGroups := float64(numNewGroup + numOldGroups)
+	shardTasks := float64(NShards)
 	availableGroupAverageLoad := shardTasks / numAvailableGroups
+
+	// sort newGroups by loads and GIDs just for consistency between peers
+	sortGroupByLoads(newGroups, sc.groupLoads, 0, numNewGroup-1, isGreater)
 
 	// first boot without joined groups
 	if numOldGroups == 0 {
@@ -470,22 +474,38 @@ func (sc *ShardCtrler) reassignGroupJoin(shards *[NShards]int, newGroups, oldGro
 		return
 	}
 
+	// sc.DPrintf("before sort: [GID, Load]\n")
+	// for _, gid := range oldGroups {
+	// 	sc.DPrintf("[%v, %v] ", gid, sc.groupLoads[gid])
+	// }
+	// sc.DPrintf("\n")
+
+	// sort oldGroups by loads and GIDs just for consistency between peers
+	sortGroupByLoads(oldGroups, sc.groupLoads, 0, numOldGroups-1, isGreater)
+
+	// sc.DPrintf("after sort: [GID, Load]\n")
+	// for _, gid := range oldGroups {
+	// 	sc.DPrintf("[%v, %v] ", gid, sc.groupLoads[gid])
+	// }
+	// sc.DPrintf("\n")
+
 	index := -1
 	for _, oldGID := range oldGroups {
-		sc.DPrintf("balancing oldGID: %d", oldGID)
+		sc.DPrintf("balancing oldGID: %d, groupLoad: %v\n", oldGID, sc.groupLoads[oldGID])
 		for needToMove(sc.groupLoads[oldGID], availableGroupAverageLoad) {
 
 			// new groups accept loads in a round turn for balanced load
 			index += 1
 			newGID := newGroups[index%numNewGroup]
 			moveOneShardTo(shards, oldGID, newGID)
+			sc.DPrintf("move one shard of oldGID: [%v] to newGID [%v]\n", oldGID, newGID)
 
 			sc.groupLoads[oldGID] -= 1
 			sc.groupLoads[newGID] += 1
 		}
 
 		// finish balancing load of a old group
-		shardTasks -= float32(sc.groupLoads[oldGID])
+		shardTasks -= float64(sc.groupLoads[oldGID])
 		numAvailableGroups -= 1
 		availableGroupAverageLoad = shardTasks / numAvailableGroups
 
@@ -499,17 +519,27 @@ func (sc *ShardCtrler) reassignGroupsLeave(shards *[NShards]int, leaveGroups, re
 
 	numRemainGroups := len(remainGroups)
 	if numRemainGroups == 0 {
-		shards = new([NShards]int)
-
+		for _, leaveGID := range leaveGroups {
+			delete(sc.groupLoads, leaveGID)
+		}
 		return
 	}
 
+	// sc.DPrintf("before sort: [GID, Load]\n")
+	// for _, gid := range remainGroups {
+	// 	sc.DPrintf("[%v, %v] ", gid, sc.groupLoads[gid])
+	// }
+	// sc.DPrintf("\n")
+
 	// sort group by loads from low load to high load
 	// so that groups with low loads may receive more shards and achieve better load balance
-	sc.DPrintf("groupLoads: %v", sc.groupLoads)
-	sc.DPrintf("before sort: %v", remainGroups)
 	sortGroupByLoads(remainGroups, sc.groupLoads, 0, numRemainGroups-1, isLess)
-	sc.DPrintf("after sort: %v", remainGroups)
+
+	// sc.DPrintf("after sort: [GID, Load]\n")
+	// for _, gid := range remainGroups {
+	// 	sc.DPrintf("[%v, %v] ", gid, sc.groupLoads[gid])
+	// }
+	// sc.DPrintf("\n")
 
 	index := -1
 	for _, leaveGID := range leaveGroups {
@@ -521,6 +551,7 @@ func (sc *ShardCtrler) reassignGroupsLeave(shards *[NShards]int, leaveGroups, re
 			index += 1
 			remainGID := remainGroups[index%numRemainGroups]
 			moveOneShardTo(shards, leaveGID, remainGID)
+			sc.DPrintf("move one shard of leaveGID: [%v] to remainGID [%v]\n", leaveGID, remainGID)
 			sc.groupLoads[remainGID] += 1
 		}
 
@@ -529,7 +560,8 @@ func (sc *ShardCtrler) reassignGroupsLeave(shards *[NShards]int, leaveGroups, re
 	}
 }
 
-// TODO: handle bugs of OpJoin and OpLeave
+// expect the caller to hold the lock
+// apply commands from applyCh sent by raft component
 func (sc *ShardCtrler) applyCommand(applyMsg *raft.ApplyMsg, op *Op) interface{} {
 	sc.DPrintf("apply command commit applyMsg, applyMsg.Index: %d, applyMsg.Op: %v", applyMsg.CommandIndex, op)
 
@@ -577,9 +609,6 @@ func (sc *ShardCtrler) applyCommand(applyMsg *raft.ApplyMsg, op *Op) interface{}
 
 		originGID := cfg.Shards[shard]
 		sc.groupLoads[originGID] -= 1
-		if sc.groupLoads[originGID] == 0 {
-			delete(sc.groupLoads, originGID)
-		}
 
 		cfg.Shards[shard] = newGID
 		sc.groupLoads[newGID] += 1

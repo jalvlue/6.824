@@ -2,6 +2,7 @@ package shardctrler
 
 import (
 	"log"
+	"math"
 
 	"6.5840/kvraft"
 )
@@ -25,20 +26,33 @@ func mapToSlice(m map[int][]string) []int {
 }
 
 // compare func
-func isGreater(a, b int) bool {
-	return a > b
+func isGreater(a, b int) int {
+	if a > b {
+		return 1
+	} else if a == b {
+		return 0
+	}
+	return -1
 }
-func isLess(a, b int) bool {
-	return a < b
+func isLess(a, b int) int {
+	if a < b {
+		return 1
+	} else if a == b {
+		return 0
+	}
+	return -1
 }
 
 // quick sort partition
-func partition(groups []int, groupLoads map[int]int, low, high int, cmp func(int, int) bool) int {
-	pivot := groupLoads[groups[high]]
+func partition(groups []int, groupLoads map[int]int, low, high int, cmp func(int, int) int) int {
+	pivotGID := groups[high]
+	pivot := groupLoads[pivotGID]
 	i := low - 1
 
 	for j := low; j < high; j++ {
-		if cmp(groupLoads[groups[j]], pivot) {
+		// divide GID with higher/lower loads into two parts
+		// for GID with loads as pivot, divide by GIDs for consistency
+		if res := cmp(groupLoads[groups[j]], pivot); res == 1 || (res == 0 && pivotGID > groups[j]) {
 			i += 1
 			groups[i], groups[j] = groups[j], groups[i]
 		}
@@ -49,7 +63,7 @@ func partition(groups []int, groupLoads map[int]int, low, high int, cmp func(int
 }
 
 // quick sort
-func sortGroupByLoads(groups []int, groupLoads map[int]int, low, high int, cmp func(int, int) bool) {
+func sortGroupByLoads(groups []int, groupLoads map[int]int, low, high int, cmp func(int, int) int) {
 	if high > low {
 		mid := partition(groups, groupLoads, low, high, cmp)
 		sortGroupByLoads(groups, groupLoads, low, mid-1, cmp)
@@ -58,9 +72,12 @@ func sortGroupByLoads(groups []int, groupLoads map[int]int, low, high int, cmp f
 }
 
 // if a group's load is bigger than averageLoad+1, then it should move loads to other groups
-func needToMove(originLoad int, averageLoad float32) bool {
-	// log.Printf("originLoad: %v, averageLoad: %v\n", originLoad, averageLoad)
-	return originLoad-int(averageLoad) > 0
+func needToMove(originLoad int, averageLoad float64) bool {
+	ceiled := int(math.Ceil(averageLoad))
+	couldMove := originLoad > ceiled
+	// log.Printf("originLoad: %v, averageLoad: %v, ceiled: %v, couldMove: %v\n", originLoad, averageLoad, ceiled, couldMove)
+
+	return couldMove
 }
 
 // move a shard load of originGroup to newGroup
