@@ -3,16 +3,25 @@ package shardctrler
 import (
 	"log"
 	"math"
-
-	"6.5840/kvraft"
+	"os"
+	"strconv"
 )
 
 var Debug bool
 
 func init() {
-	Debug = kvraft.Debug
+	Debug = getDebugState()
 
 	log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
+}
+
+func getDebugState() bool {
+	level := 0
+	if v, _ := strconv.Atoi(os.Getenv("VERBOSE")); v > 0 {
+		level = 1
+	}
+
+	return level != 0
 }
 
 // collect keys of a map to a slice
