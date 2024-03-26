@@ -114,6 +114,12 @@ func (sc *ShardCtrler) getLastConfig() Config {
 func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	// Your code here.
 
+	if _, isLeader := sc.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		sc.DPrintf("I am not leader, return with ErrWrongLeader\n")
+		return
+	}
+
 	// for debug
 	gids := mapToSlice(args.Servers)
 	sc.DPrintf("receive Join RPC from clerk [%v], args.RequestID: \"%v\", args.Gids: %v\n", args.ClerkID, args.RequestID, gids)
@@ -132,7 +138,7 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	sc.mu.RUnlock()
 
 	// ask raft to reach consensus
-	index, _, isLeader := sc.rf.Start(
+	index, _, _ := sc.rf.Start(
 		Op{
 			Type:      OpJoin,
 			Params:    []interface{}{args.Servers},
@@ -140,11 +146,6 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 			RequestID: args.RequestID,
 		},
 	)
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-		sc.DPrintf("I am not leader, return with ErrWrongLeader\n")
-		return
-	}
 
 	// prepare to receive raft consensus reply
 	sc.mu.Lock()
@@ -192,6 +193,12 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	// Your code here.
 
+	if _, isLeader := sc.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		sc.DPrintf("I am not leader, return with ErrWrongLeader\n")
+		return
+	}
+
 	sc.DPrintf("receive Leave RPC from clerk [%v], args.RequestID: \"%v\", args.Gids: %v\n", args.ClerkID, args.RequestID, args.GIDs)
 
 	sc.mu.RLock()
@@ -205,8 +212,7 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 		return
 	}
 	sc.mu.RUnlock()
-
-	index, _, isLeader := sc.rf.Start(
+	index, _, _ := sc.rf.Start(
 		Op{
 			Type:      OpLeave,
 			Params:    []interface{}{args.GIDs},
@@ -214,13 +220,6 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 			RequestID: args.RequestID,
 		},
 	)
-
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-
-		sc.DPrintf("I am not leader, return with ErrWrongLeader\n")
-		return
-	}
 
 	sc.mu.Lock()
 	sc.produceCount += 1
@@ -265,6 +264,12 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 	// Your code here.
 
+	if _, isLeader := sc.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		sc.DPrintf("I am not leader, return with ErrWrongLeader\n")
+		return
+	}
+
 	sc.DPrintf("receive Move RPC from clerk [%v], args.RequestID: \"%v\", args.GID: %v, args.Shard: %v\n", args.ClerkID, args.RequestID, args.GID, args.Shard)
 
 	sc.mu.RLock()
@@ -279,7 +284,7 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 	}
 	sc.mu.RUnlock()
 
-	index, _, isLeader := sc.rf.Start(
+	index, _, _ := sc.rf.Start(
 		Op{
 			Type:      OpMove,
 			Params:    []interface{}{args.Shard, args.GID},
@@ -287,13 +292,6 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 			RequestID: args.RequestID,
 		},
 	)
-
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-
-		sc.DPrintf("I am not leader, return with ErrWrongLeader\n")
-		return
-	}
 
 	sc.mu.Lock()
 	sc.produceCount += 1
@@ -338,6 +336,12 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	// Your code here.
 
+	if _, isLeader := sc.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		sc.DPrintf("I am not leader, return with ErrWrongLeader\n")
+		return
+	}
+
 	sc.DPrintf("receive Query RPC from clerk [%v], args.RequestID: \"%v\", args.Num: %v\n", args.ClerkID, args.RequestID, args.Num)
 
 	sc.mu.RLock()
@@ -353,7 +357,7 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	}
 	sc.mu.RUnlock()
 
-	index, _, isLeader := sc.rf.Start(
+	index, _, _ := sc.rf.Start(
 		Op{
 			Type:      OpQuery,
 			Params:    []interface{}{args.Num},
@@ -361,13 +365,6 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 			RequestID: args.RequestID,
 		},
 	)
-
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-
-		sc.DPrintf("I am not leader, return with ErrWrongLeader\n")
-		return
-	}
 
 	sc.mu.Lock()
 	sc.produceCount += 1
@@ -579,7 +576,7 @@ func (sc *ShardCtrler) applyCommand(applyMsg *raft.ApplyMsg, op *Op) interface{}
 			cfg.Groups[k] = v
 		}
 
-		sc.DPrintf("new config: %v, Groups: %v\n", cfg.Shards, mapToSlice(cfg.Groups))
+		sc.DPrintf("new config apply, config Num: %v, config Shards: %v, config Groups: %v\n", cfg.Num, cfg.Shards, mapToSlice(cfg.Groups))
 		sc.configs = append(sc.configs, cfg)
 		return nil
 
@@ -594,7 +591,7 @@ func (sc *ShardCtrler) applyCommand(applyMsg *raft.ApplyMsg, op *Op) interface{}
 		}
 
 		sc.reassignGroupsLeave(&cfg.Shards, leaveGroups, mapToSlice(cfg.Groups))
-		sc.DPrintf("new config: %v, Groups: %v\n", cfg.Shards, mapToSlice(cfg.Groups))
+		sc.DPrintf("new config apply, config Num: %v, config Shards: %v, config Groups: %v\n", cfg.Num, cfg.Shards, mapToSlice(cfg.Groups))
 
 		sc.configs = append(sc.configs, cfg)
 		return nil
@@ -613,7 +610,7 @@ func (sc *ShardCtrler) applyCommand(applyMsg *raft.ApplyMsg, op *Op) interface{}
 		cfg.Shards[shard] = newGID
 		sc.groupLoads[newGID] += 1
 
-		sc.DPrintf("new config: %v, Groups: %v\n", cfg.Shards, mapToSlice(cfg.Groups))
+		sc.DPrintf("new config apply, config Num: %v, config Shards: %v, config Groups: %v\n", cfg.Num, cfg.Shards, mapToSlice(cfg.Groups))
 		sc.configs = append(sc.configs, cfg)
 
 		return nil
