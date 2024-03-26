@@ -75,9 +75,9 @@ func (ck *Clerk) Query(num int) Config {
 
 	leader := ck.lastLeaderID
 	for {
-		ck.DPrintf("send Query RPC request to service, args.Num: \"%v\", args.RequestID: \"%v\"\n", num, args.RequestID)
+		// ck.DPrintf("send Query RPC request to service, args.Num: \"%v\", args.RequestID: \"%v\"\n", num, args.RequestID)
 		if ok := ck.servers[leader].Call("ShardCtrler.Query", args, reply); ok && reply.Err == OK {
-			ck.DPrintf("receive Query response form service, reply.Config: %v\n", reply.Config)
+			// ck.DPrintf("receive Query response form service, reply.Config: %v\n", reply.Config)
 
 			ck.lastLeaderID = leader
 			return reply.Config
@@ -104,9 +104,9 @@ func (ck *Clerk) Join(servers map[int][]string) {
 
 	leader := ck.lastLeaderID
 	for {
-		ck.DPrintf("send Join RPC request to service, args.RequestID: \"%v\"\n", args.RequestID)
+		// ck.DPrintf("send Join RPC request to service, args.RequestID: \"%v\"\n", args.RequestID)
 		if ok := ck.servers[leader].Call("ShardCtrler.Join", args, reply); ok && reply.Err == OK {
-			ck.DPrintf("receive Join response form service\n")
+			// ck.DPrintf("receive Join response form service\n")
 
 			ck.lastLeaderID = leader
 			return
@@ -133,9 +133,9 @@ func (ck *Clerk) Leave(gids []int) {
 
 	leader := ck.lastLeaderID
 	for {
-		ck.DPrintf("send Leave RPC request to service, args.GIDs: %v, args.RequestID: \"%v\"\n", gids, args.RequestID)
+		// ck.DPrintf("send Leave RPC request to service, args.GIDs: %v, args.RequestID: \"%v\"\n", gids, args.RequestID)
 		if ok := ck.servers[leader].Call("ShardCtrler.Leave", args, reply); ok && reply.Err == OK {
-			ck.DPrintf("receive Leave response form service\n")
+			// ck.DPrintf("receive Leave response form service\n")
 
 			ck.lastLeaderID = leader
 			return
@@ -163,9 +163,9 @@ func (ck *Clerk) Move(shard int, gid int) {
 
 	leader := ck.lastLeaderID
 	for {
-		ck.DPrintf("send Move RPC request to service, args.Shard: \"%v\", args.GID: \"%v\", args.RequestID: \"%v\"\n", shard, gid, args.RequestID)
+		// ck.DPrintf("send Move RPC request to service, args.Shard: \"%v\", args.GID: \"%v\", args.RequestID: \"%v\"\n", shard, gid, args.RequestID)
 		if ok := ck.servers[leader].Call("ShardCtrler.Move", args, reply); ok && reply.Err == OK {
-			ck.DPrintf("receive Move response form service\n")
+			// ck.DPrintf("receive Move response form service\n")
 
 			ck.lastLeaderID = leader
 			return
