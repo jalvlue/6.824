@@ -97,11 +97,12 @@ func (ck *Clerk) Get(key string) string {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 
-		ck.DPrintf("send GET RPC request to service, GID: %v, Shard: %v, args.Key: %v, args.RequestID: %v\n", gid, shard, key, args.RequestID)
-
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
 			for si := 0; si < len(servers); si++ {
+
+				ck.DPrintf("send GET RPC request to service, GID: %v, server: %v, Shard: %v, args.Key: %v, args.RequestID: %v\n", gid, si, shard, key, args.RequestID)
+
 				srv := ck.make_end(servers[si])
 				var reply GetReply
 				if ok := srv.Call("ShardKV.Get", &args, &reply); ok {
@@ -148,10 +149,11 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 
-		ck.DPrintf("send PutAppend RPC request to service, GID: %v, Shard: %v, args.Key: %v, args.Value: %v, args.Op: %v, args.RequestID: %v\n", gid, shard, key, value, op, args.RequestID)
-
 		if servers, ok := ck.config.Groups[gid]; ok {
 			for si := 0; si < len(servers); si++ {
+
+				ck.DPrintf("send PutAppend RPC request to service, GID: %v, server: %v, Shard: %v, args.Key: %v, args.Value: %v, args.Op: %v, args.RequestID: %v\n", gid, si, shard, key, value, op, args.RequestID)
+
 				srv := ck.make_end(servers[si])
 				var reply PutAppendReply
 				if ok := srv.Call("ShardKV.PutAppend", &args, &reply); ok {
