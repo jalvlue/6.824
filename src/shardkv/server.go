@@ -41,8 +41,8 @@ type ConfigTransmitter struct {
 	InShards     map[int]struct{}
 	LeaveShards  map[int]struct{}
 
-	// ShardDB              []map[string]string
-	// ShardPrevRequestInfo []map[int64]requestInfo
+	// []mapping: inShardID -> inShardDB
+	ShardDB map[int]*ShardDB
 }
 
 type Op struct {
@@ -72,6 +72,7 @@ type ShardKV struct {
 	gid          int
 	ctrlers      []*labrpc.ClientEnd
 	maxraftstate int // snapshot if log grows this big
+	initCommit   bool
 
 	// Your definitions here.
 
@@ -83,6 +84,7 @@ type ShardKV struct {
 
 	// K/V database
 	// mapping: shardID -> ShardDB
+	// TODO: consider use *ShardDB or ShardDB
 	db map[int]*ShardDB
 
 	// mapping: raftCommandIndex int -> requestResultTransmitter
@@ -361,28 +363,45 @@ func (kv *ShardKV) handleApplyMsg() {
 				kv.DPrintf("receive config change applyMsg, applyMsg.CommandIndex: %d, new config: %v, inShards: %v, leaveShards: %v\n", applyMsg.CommandIndex, cfgTransmitter.GlobalConfig, cfgTransmitter.InShards, cfgTransmitter.LeaveShards)
 
 				kv.cfg.GlobalConfig = cfgTransmitter.GlobalConfig
-				for inShardID := range cfgTransmitter.InShards {
-					kv.cfg.MyShards[inShardID] = struct{}{}
-					kv.db[inShardID] = &ShardDB{
-						KVMap:  map[string]string{},
-						DupMap: map[int64]requestInfo{},
+
+				// first config, there is no transfer shard
+				if cfgTransmitter.GlobalConfig.Num == 1 {
+					for inShardID := range cfgTransmitter.InShards {
+						kv.cfg.MyShards[inShardID] = struct{}{}
+						kv.db[inShardID] = &ShardDB{
+							KVMap:  map[string]string{},
+							DupMap: map[int64]requestInfo{},
+						}
+					}
+				} else {
+
+					// new config with inShards need to be transfered
+					for inShardID := range cfgTransmitter.InShards {
+						kv.cfg.MyShards[inShardID] = struct{}{}
+						tmp := &ShardDB{
+							KVMap:  map[string]string{},
+							DupMap: map[int64]requestInfo{},
+						}
+
+						for k, v := range cfgTransmitter.ShardDB[inShardID].KVMap {
+							tmp.KVMap[k] = v
+						}
+						for k, v := range cfgTransmitter.ShardDB[inShardID].DupMap {
+							tmp.DupMap[k] = v
+						}
+
+						kv.db[inShardID] = tmp
+					}
+
+					for leaveShardID := range cfgTransmitter.LeaveShards {
+						delete(kv.cfg.MyShards, leaveShardID)
+
+						// TODO: GC
+						// delete(kv.db, leaveShardID)
 					}
 				}
 
-				for leaveShardID := range cfgTransmitter.LeaveShards {
-					delete(kv.db, leaveShardID)
-				}
-
 				kv.DPrintf("config change apply, kv.cfg.Myshards: %v\n", kv.cfg.MyShards)
-
-				// // it is safe to iter a nil slice
-				// for i, shard := range cfgTransmitter.InShards {
-				// 	kv.db[shard] = cfgTransmitter.ShardDB[i]
-				// 	kv.clerkPrevRequestInfo[shard] = cfgTransmitter.ShardPrevRequestInfo[i]
-				// }
-
-				// kv.rf.Snapshot(applyMsg.CommandIndex, kv.generateSnapshot())
-				// kv.DPrintf("new config apply, snapshot created and sent to raft\n")
 
 				kv.mu.Unlock()
 				continue
@@ -392,7 +411,9 @@ func (kv *ShardKV) handleApplyMsg() {
 			if op, ok := applyMsg.Command.(Op); ok {
 
 				if op.Type == OpInit {
+					kv.initCommit = false
 					kv.mu.Unlock()
+
 					kv.DPrintf("receive initial commit applyMsg, applyMsg.CommandIndex: %v\n", applyMsg.CommandIndex)
 					continue
 				}
@@ -523,96 +544,90 @@ func (kv *ShardKV) applySnapshot(snapshotBytes []byte) {
 	}
 }
 
-// func (kv *ShardKV) PullShard(args *TransferShardArgs, reply *TransferShardReply) {
-// 	if _, isLeader := kv.rf.GetState(); !isLeader {
-// 		reply.Err = ErrWrongLeader
-// 		kv.DPrintf("receive PullShard RPC, I am not Leader, return with ErrWrongLeader\n")
-// 		return
-// 	}
+func (kv *ShardKV) PullShard(args *PullShardArgs, reply *PullShardReply) {
+	// only the leader could push shards to other groups
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
 
-// 	kv.DPrintf("receive PullShard RPC form GID %v, args.Shard, args.Version\n", args.GID, args.Shard, args.Num)
+	kv.DPrintf("receive PullShard RPC form GID %v, args.PullShardID: %v, args.Num: %v\n", args.GID, args.PullShardID, args.Num)
 
-// 	kv.mu.RLock()
-// 	// different num
-// 	if args.Num != kv.cfg.Num {
-// 		if args.Num > kv.cfg.Num {
-// 			reply.Err = ErrHigherNum
-// 		} else {
-// 			reply.Err = ErrLowerNum
-// 		}
+	kv.mu.RLock()
 
-// 		kv.DPrintf("ErrWrongNum, args.Num: %v, kv.cfg.Num: %v\n", args.Num, kv.cfg.Num)
+	// different config num
+	// I have a lower num, return with ErrHigherNum, and wait for my config update
+	if args.Num > kv.cfg.GlobalConfig.Num {
 
-// 		kv.mu.RUnlock()
-// 		return
-// 	}
+		kv.DPrintf("ErrHigherNum, args.Num: %v, myNum: %v\n", args.Num, kv.cfg.GlobalConfig.Num)
 
-// 	reply.Err = OK
-// 	reply.ShardDB = kv.db[args.Shard]
-// 	reply.ShardPrevRequestInfo = kv.clerkPrevRequestInfo[args.Shard]
+		kv.mu.RUnlock()
+		reply.Err = ErrHigherNum
+		return
+	}
 
-// 	kv.DPrintf("shard: %v transfer to GID: %v success\n", args.Shard, args.GID)
+	reply.Err = OK
+	reply.ShardDB = ShardDB{
+		KVMap:  kv.db[args.PullShardID].KVMap,
+		DupMap: kv.db[args.PullShardID].DupMap,
+	}
 
-// 	kv.mu.RUnlock()
-// }
+	kv.DPrintf("PullShardID: %v transfer to GID: %v success\n", args.PullShardID, args.GID)
+	kv.mu.RUnlock()
+}
 
-// // pull inShards from other groups
-// func (kv *ShardKV) pullInShards(inShards []int, cfgTransmitter *ConfigTransmitter) {
+// pull inShards from other groups
+func (kv *ShardKV) pullInShards(inShards map[int]struct{}, cfgTransmitter *ConfigTransmitter) {
 
-// 	var wg sync.WaitGroup
-// 	wg.Add(len(inShards))
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	wg.Add(len(inShards))
 
-// 	for i, shard := range inShards {
+	for inShardID := range inShards {
 
-// 		go func(i, shard int, wg *sync.WaitGroup) {
-// 			gid := lastCfg.Shards[shard]
-// 			if servers, ok := lastCfg.Groups[gid]; ok {
-// 				args := TransferShardArgs{
-// 					GID:   kv.gid,
-// 					Shard: shard,
-// 					Num:   kv.cfg.Num,
-// 				}
+		go func(inShardID int, wg *sync.WaitGroup) {
 
-// 				kv.DPrintf("for inShard: %v, GID: %v\n", shard, gid)
+			targetGID := kv.cfg.GlobalConfig.Shards[inShardID]
+			if servers, ok := kv.cfg.GlobalConfig.Groups[targetGID]; ok {
+				args := PullShardArgs{
+					GID:         kv.gid,
+					Num:         kv.cfg.GlobalConfig.Num + 1,
+					PullShardID: inShardID,
+				}
 
-// 				// for !kv.killed() {
-// 				for si := 0; si < len(servers); si++ {
-// 					srv := kv.make_end(servers[si])
-// 					var reply TransferShardReply
+				for !kv.killed() {
+					for si := 0; si < len(servers); si++ {
+						srv := kv.make_end(servers[si])
+						var reply PullShardReply
 
-// 					kv.DPrintf("send PullShard RPC request to GID: %v, serverID: %v, args,Shard: %v, args.Num: %v\n", gid, si, shard, shard, args.Num)
+						if ok := srv.Call("ShardKV.PullShard", &args, &reply); ok {
+							if reply.Err == OK {
+								// although different inShardID as keys were put in to the map
+								// and it would no cause a error
+								// but it would cause a data race
+								mu.Lock()
+								cfgTransmitter.ShardDB[inShardID] = &reply.ShardDB
+								mu.Unlock()
 
-// 					if ok := srv.Call("ShardKV.PullShard", &args, &reply); ok {
+								kv.DPrintf("receive PullShard RPC response, inShardID: %v, targetGID: %v\n", inShardID, targetGID)
 
-// 						if reply.Err == OK {
-// 							cfgTransmitter.ShardDB[i] = reply.ShardDB
-// 							cfgTransmitter.ShardPrevRequestInfo[i] = reply.ShardPrevRequestInfo
+								wg.Done()
+								return
+							} else if reply.Err == ErrHigherNum {
+								time.Sleep(20 * time.Millisecond)
+							}
+						}
+					}
+				}
+			}
+		}(inShardID, &wg)
+	}
 
-// 							kv.DPrintf("receive PullShard RPC response from GID: %v, serverID: %v, request success, shard: %v pulled\n", gid, si, shard)
-
-// 							wg.Done()
-// 							return
-
-// 						} else if reply.Err == ErrLowerNum {
-
-// 							kv.DPrintf("receive PullShard RPC response from GID: %v, serverID: %v, request failed, ErrLowerNum\n", gid, si)
-
-// 							wg.Done()
-// 							return
-// 						}
-// 					}
-// 				}
-// 				// }
-// 			}
-// 		}(i, shard, &wg)
-// 	}
-
-// 	wg.Wait()
-// }
+	wg.Wait()
+}
 
 // long-running go routine asking shardctrler for latest config every 100ms
 func (kv *ShardKV) queryConfig() {
-	initialCommit := true
 	for !kv.killed() {
 
 		// only the leader of this group would poll the latest config
@@ -624,34 +639,46 @@ func (kv *ShardKV) queryConfig() {
 			continue
 		}
 
+		kv.mu.RLock()
+
 		// initial commit to bring all states back after a crash (if any)
-		if initialCommit {
-			initialCommit = false
+		if kv.initCommit {
 			kv.rf.Start(Op{
 				Type: OpInit,
 			})
+
+			kv.mu.RUnlock()
 			time.Sleep(QUERY_CONFIG_INTERVAL)
 			continue
 		}
 
-		kv.mu.RLock()
-
+		// only update one version in a query
 		if newCfg := kv.mck.Query(kv.cfg.GlobalConfig.Num + 1); newCfg.Num > kv.cfg.GlobalConfig.Num {
-			kv.DPrintf("new config found, prepare updating to version: %v\n", newCfg.Num)
+			kv.DPrintf("new config found, prepare updating to version: %v\n", newCfg)
 
 			newMyShards := map[int]struct{}{}
-			for shardID := range newCfg.Shards {
-				if kv.gid == newCfg.Shards[shardID] {
+			for shardID, GID := range newCfg.Shards {
+				if kv.gid == GID {
 					newMyShards[shardID] = struct{}{}
 				}
 			}
 
 			inShards, leaveShards := getInAndLeaveShards(kv.cfg.MyShards, newMyShards)
 
+			kv.DPrintf("oldMyShards: %v, newMyShards: %v, inShards: %v, leaveShards: %v", kv.cfg.MyShards, newMyShards, inShards, leaveShards)
+
 			cfgTransmitter := ConfigTransmitter{
 				GlobalConfig: newCfg,
 				InShards:     inShards,
 				LeaveShards:  leaveShards,
+			}
+
+			// for initialization(newCfg.Num == 1) or not inShards come in(len(inShards == 0)), no need to pullInShards
+			if newCfg.Num > 1 && len(inShards) > 0 {
+				kv.DPrintf("new config with inShards to pull, begin pulling Inshards\n")
+				cfgTransmitter.ShardDB = make(map[int]*ShardDB)
+
+				kv.pullInShards(inShards, &cfgTransmitter)
 			}
 
 			index, _, _ := kv.rf.Start(
@@ -660,40 +687,6 @@ func (kv *ShardKV) queryConfig() {
 
 			kv.DPrintf("begin syncing new config with peers through raft, applyIndex: %v\n", index)
 		}
-
-		// // only update one version in a query
-		// if newCfg := kv.mck.Query(kv.cfg.Num + 1); newCfg.Num > kv.cfg.Num {
-		// 	kv.DPrintf("new config found, update to version: %v\n", newCfg.Num)
-		// 	newMyShards := map[int]struct{}{}
-		// 	for shard, GID := range newCfg.Shards {
-		// 		if GID == kv.gid {
-		// 			newMyShards[shard] = struct{}{}
-		// 		}
-		// 	}
-		// 	inShards, leaveShards := getInAndLeaveShards(kv.cfg.MyShards, newMyShards)
-		// 	kv.DPrintf("oldMyShards: %v, newMyShards: %v, inShards: %v, leaveShards: %v\n", kv.cfg.MyShards, newMyShards, inShards, leaveShards)
-		// 	cfgTransmitter := ConfigTransmitter{
-		// 		Cfg: shardctrler.Config{
-		// 			Num:    newCfg.Num,
-		// 			Shards: newCfg.Shards,
-		// 			Groups: newCfg.Groups,
-		// 		},
-		// 	}
-		// 	// for initialization(newCfg.Num == 1), no need to pullInShards
-		// 	if newCfg.Num > 1 && len(inShards) > 0 {
-		// 		kv.DPrintf("new config with inShards, begin pull inShards")
-		// 		cfgTransmitter.InShards = inShards
-		// 		cfgTransmitter.ShardDB = make([]map[string]string, len(inShards))
-		// 		cfgTransmitter.ShardPrevRequestInfo = make([]map[int64]requestInfo, len(inShards))
-		// 		// TODO: consider pullInShards
-		// 		kv.pullInShards(inShards, &cfgTransmitter)
-		// 	}
-		// 	index, _, _ := kv.rf.Start(
-		// 		cfgTransmitter,
-		// 	)
-		// 	// kv.cfg.MyShards = newMyShards
-		// 	kv.DPrintf("begin syncing new config with peers through raft, applyIndex: %v\n", index)
-		// }
 
 		kv.mu.RUnlock()
 
@@ -759,6 +752,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.produceCount = 0
 	kv.consumeCount = 0
+	kv.initCommit = true
 
 	kv.db = map[int]*ShardDB{}
 	kv.requestMap = sync.Map{}

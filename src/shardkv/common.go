@@ -16,6 +16,8 @@ const (
 	ErrWrongLeader = "ErrWrongLeader"
 	ErrRepTimeout  = "ErrRepTimeout"
 	ErrDefault     = ""
+	ErrLowerNum    = "ErrLowerNum"
+	ErrHigherNum   = "ErrHigherNum"
 )
 
 type Err string
@@ -49,4 +51,15 @@ type GetArgs struct {
 type GetReply struct {
 	Err   Err
 	Value string
+}
+
+type PullShardArgs struct {
+	GID         int
+	PullShardID int
+	Num         int
+}
+
+type PullShardReply struct {
+	Err     Err
+	ShardDB ShardDB
 }
