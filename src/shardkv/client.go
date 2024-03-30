@@ -57,8 +57,11 @@ type Clerk struct {
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
 
-	clerkID       int64
-	lastRequestID int64
+	clerkID   int64
+	requestID int64
+
+	// mapping: gid -> leaderServerID
+	leaderIDs map[int]int
 }
 
 // the tester calls MakeClerk.
@@ -69,15 +72,56 @@ type Clerk struct {
 // Config.Groups[gid][i] into a labrpc.ClientEnd on which you can
 // send RPCs.
 func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *Clerk {
-	ck := new(Clerk)
-	ck.sm = shardctrler.MakeClerk(ctrlers)
-	ck.make_end = make_end
-	// You'll have to add code here.
+	ck := &Clerk{
+		sm:        shardctrler.MakeClerk(ctrlers),
+		make_end:  make_end,
+		clerkID:   nrand(),
+		requestID: 0,
+		leaderIDs: map[int]int{},
+	}
 
-	ck.clerkID = nrand()
-	ck.lastRequestID = 0
-
+	ck.config = ck.sm.Query(-1)
 	return ck
+}
+
+func (ck *Clerk) command(args *CommandArgs) string {
+	args.ClerkID = ck.clerkID
+	args.RequestID = ck.requestID
+
+	for {
+		keyShardID := key2shard(args.Key)
+		gid := ck.config.Shards[keyShardID]
+		leaderID := ck.leaderIDs[gid]
+
+		if servers, ok := ck.config.Groups[gid]; ok {
+
+			for {
+				ck.DPrintf("send command request to service, GID: %v, server: %v, Shard: %v, args.RequestID: %v, args.CommandOp: %v, args.Key: %v, args.Value: %v\n", gid, leaderID, keyShardID, args.RequestID, args.CommandOp, args.Key, args.Value)
+
+				var reply CommandReply
+				if ok := ck.make_end(servers[leaderID]).Call("ShardKV.Command", args, &reply); ok {
+
+					if reply.Err == OK || reply.Err == ErrNoKey {
+						ck.DPrintf("receive command response from service, reply.Err: %v, reply.Value: %v, args.RequestID: %v, args.CommandOp: %v, args.Key: %v, args.Value: %v\n", args.RequestID, reply.Err, reply.Value, args.CommandOp, args.Key, args.Value)
+
+						ck.requestID += 1
+						ck.leaderIDs[gid] = leaderID
+						return reply.Value
+					} else if reply.Err == ErrWrongGroup {
+						ck.DPrintf("ErrWrongGroup, command request fail, args.RequestID: %v, args.Op: %v, args.Key: %v, args.Value: %v\n", args.RequestID, args.CommandOp, args.Key, args.Value)
+						break
+					}
+				}
+				// ... not ok, or ErrWrongLeader
+				// try next server
+				leaderID = (leaderID + 1) % len(servers)
+			}
+		}
+
+		time.Sleep(CLERK_REQUEST_INTERVAL)
+		// ask controler for the latest configuration.
+		ck.config = ck.sm.Query(-1)
+	}
 }
 
 // fetch the current value for a key.
@@ -85,102 +129,24 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 // keeps trying forever in the face of all other errors.
 // You will have to modify this function.
 func (ck *Clerk) Get(key string) string {
-
-	ck.lastRequestID += 1
-
-	args := GetArgs{}
-	args.Key = key
-	args.ClerkID = ck.clerkID
-	args.RequestID = ck.lastRequestID
-
-	for {
-		shard := key2shard(key)
-		gid := ck.config.Shards[shard]
-
-		if servers, ok := ck.config.Groups[gid]; ok {
-			// try each server for the shard.
-			for si := 0; si < len(servers); si++ {
-
-				ck.DPrintf("send GET RPC request to service, GID: %v, server: %v, Shard: %v, args.Key: %v, args.RequestID: %v\n", gid, si, shard, key, args.RequestID)
-
-				srv := ck.make_end(servers[si])
-				var reply GetReply
-				if ok := srv.Call("ShardKV.Get", &args, &reply); ok {
-
-					if reply.Err == OK {
-						ck.DPrintf("receive GET response from service, args.RequestID: %v, GET Key: %v, Value: %v\n", args.RequestID, key, reply.Value)
-						return reply.Value
-
-					} else if reply.Err == ErrNoKey {
-						ck.DPrintf("ErrNoKey, GET RPC fail, args.RequestID: %v, GET Key: %v\n", args.RequestID, key)
-						return reply.Value
-
-					} else if reply.Err == ErrWrongGroup {
-						ck.DPrintf("ErrWrongGroup, GET RPC fail, args.RequestID: %v, GET Key: %v\n", args.RequestID, key)
-						break
-
-					}
-				}
-				// ... not ok, or ErrWrongLeader
-			}
-		}
-
-		time.Sleep(CLERK_REQUEST_INTERVAL)
-		// ask controler for the latest configuration.
-		ck.config = ck.sm.Query(-1)
-	}
-}
-
-// shared by Put and Append.
-// You will have to modify this function.
-func (ck *Clerk) PutAppend(key string, value string, op string) {
-
-	ck.lastRequestID += 1
-
-	args := PutAppendArgs{
+	return ck.command(&CommandArgs{
 		Key:       key,
-		Value:     value,
-		Op:        op,
-		ClerkID:   ck.clerkID,
-		RequestID: ck.lastRequestID,
-	}
-
-	for {
-		shard := key2shard(key)
-		gid := ck.config.Shards[shard]
-
-		if servers, ok := ck.config.Groups[gid]; ok {
-			for si := 0; si < len(servers); si++ {
-
-				ck.DPrintf("send PutAppend RPC request to service, GID: %v, server: %v, Shard: %v, args.Key: %v, args.Value: %v, args.Op: %v, args.RequestID: %v\n", gid, si, shard, key, value, op, args.RequestID)
-
-				srv := ck.make_end(servers[si])
-				var reply PutAppendReply
-				if ok := srv.Call("ShardKV.PutAppend", &args, &reply); ok {
-
-					if reply.Err == OK {
-						ck.DPrintf("receive PutAppend response from service, args.RequestID: %v, PutAppend Key: %v, Value: %v\n", args.RequestID, key, value)
-						return
-
-					} else if reply.Err == ErrWrongGroup {
-						ck.DPrintf("ErrWrongGroup, PutAppend RPC fail, args.RequestID: %v, PutAppend Key: %v, Value: %v\n", args.RequestID, key, value)
-						break
-
-					}
-				}
-				// ... not ok, or ErrWrongLeader
-			}
-		}
-
-		time.Sleep(CLERK_REQUEST_INTERVAL)
-		// ask controler for the latest configuration.
-		ck.config = ck.sm.Query(-1)
-	}
+		CommandOp: CommandGet,
+	})
 }
 
 func (ck *Clerk) Put(key string, value string) {
-	ck.PutAppend(key, value, OpPut)
+	ck.command(&CommandArgs{
+		Key:       key,
+		Value:     value,
+		CommandOp: CommandPut,
+	})
 }
+
 func (ck *Clerk) Append(key string, value string) {
-	ck.PutAppend(key, value, OpAppend)
+	ck.command(&CommandArgs{
+		Key:       key,
+		Value:     value,
+		CommandOp: CommandAppend,
+	})
 }

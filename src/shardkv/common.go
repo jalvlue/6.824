@@ -16,8 +16,7 @@ const (
 	ErrWrongLeader = "ErrWrongLeader"
 	ErrRepTimeout  = "ErrRepTimeout"
 	ErrDefault     = ""
-	ErrLowerNum    = "ErrLowerNum"
-	ErrHigherNum   = "ErrHigherNum"
+	ErrWrongNum    = "ErrWrongNum"
 )
 
 type Err string
@@ -54,12 +53,47 @@ type GetReply struct {
 }
 
 type PullShardArgs struct {
-	GID         int
-	PullShardID int
-	Num         int
+	Num      int
+	ShardIDs []int
 }
 
 type PullShardReply struct {
-	Err     Err
-	ShardDB ShardDB
+	Err Err
+	Num int
+
+	// mapping: inShardID -> shardDB
+	ShardDBs map[int]ShardDB
 }
+
+// more general command args, takes care of all Get, Put and Append client command requests
+type CommandArgs struct {
+	Key       string
+	Value     string
+	CommandOp commandOperation
+	ClerkID   int64
+	RequestID int64
+}
+
+type CommandReply struct {
+	Err   Err
+	Value string
+}
+
+// command op from client, Get, Put and Append
+type commandOperation uint8
+
+const (
+	CommandGet commandOperation = iota
+	CommandPut
+	CommandAppend
+)
+
+// shard status
+type shardStatus uint8
+
+const (
+	StatusServing shardStatus = iota
+	StatusPulling
+	StatusBePulling
+	StatusInvalid
+)
