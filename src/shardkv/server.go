@@ -16,8 +16,7 @@ import (
 
 const (
 	MIGRATE_SHARDS_INTERVAL = 50 * time.Millisecond
-	RESTORE_STATE_INTERVAL  = 100 * time.Millisecond
-	QUERY_CONFIG_INTERVAL   = 100 * time.Millisecond
+	QUERY_CONFIG_INTERVAL   = 50 * time.Millisecond
 	CLERK_WAITING_TIMEOUT   = 200 * time.Millisecond
 )
 
@@ -75,7 +74,6 @@ type ShardKV struct {
 
 	// K/V database
 	// mapping: shardID -> ShardDB
-	// TODO: consider use *ShardDB or ShardDB
 	db map[int]*ShardDB
 
 	// mapping: raftCommandIndex int -> requestResultTransmitter
@@ -278,42 +276,47 @@ func (kv *ShardKV) handleApplyMsg() {
 					}
 				case OpConfiguration:
 					{
-						kv.DPrintf("config change operation\n")
-
 						newCfg := op.Params.(shardctrler.Config)
-						kv.lastCfg = kv.currentCfg
-						kv.currentCfg = &newCfg
 
-						// no need to pull shards in first config(newCfg.Num == 1)
-						// only initialize ShardDB maps instead
-						if kv.currentCfg.Num == 1 {
-							for shardID := range kv.currentCfg.Shards {
-								if kv.currentCfg.Shards[shardID] == kv.gid {
-									kv.db[shardID] = &ShardDB{
-										Status: StatusServing,
-										KVMap:  map[string]string{},
-										DupMap: map[int64]requestInfo{},
+						// filter unreliable duplicated config change operations
+						if kv.currentCfg.Num+1 == newCfg.Num {
+							kv.DPrintf("config change operation, kv.currentCfg.Num: %v\n", newCfg.Num)
+							kv.lastCfg = kv.currentCfg
+							kv.currentCfg = &newCfg
+
+							// no need to pull shards in first config(newCfg.Num == 1)
+							// only initialize ShardDB maps instead
+							if kv.currentCfg.Num == 1 {
+								for shardID := range kv.currentCfg.Shards {
+									if kv.currentCfg.Shards[shardID] == kv.gid {
+										kv.db[shardID] = &ShardDB{
+											Status: StatusServing,
+											KVMap:  map[string]string{},
+											DupMap: map[int64]requestInfo{},
+										}
+									}
+								}
+							} else {
+								for shardID, currentGID := range kv.currentCfg.Shards {
+									if kv.lastCfg.Shards[shardID] == kv.gid && currentGID != kv.gid {
+
+										// TODO: set status to StatusInvalid and do GC after other groups pulled this shard
+
+										// I own this shard in lastCfg, but I lose it in currentCfg
+										// set shard status to StatusBePulling and wait for other groups to pull this shard
+										kv.db[shardID].Status = StatusBePulling
+
+									} else if kv.lastCfg.Shards[shardID] != kv.gid && currentGID == kv.gid {
+
+										// I do not own this shard in lastCfg, but I own it in currentCfg
+										// set shard status to SattusPulling and wait for migrateShards goroutine to pull it from other groups
+										kv.db[shardID].Status = StatusPulling
+
 									}
 								}
 							}
 						} else {
-							for shardID, currentGID := range kv.currentCfg.Shards {
-								if kv.lastCfg.Shards[shardID] == kv.gid && currentGID != kv.gid {
-
-									// TODO: set status to StatusInvalid and do GC after other groups pulled this shard
-
-									// I own this shard in lastCfg, but I lose it in currentCfg
-									// set shard status to StatusBePulling and wait for other groups to pull this shard
-									kv.db[shardID].Status = StatusBePulling
-
-								} else if kv.lastCfg.Shards[shardID] != kv.gid && currentGID == kv.gid {
-
-									// I do not own this shard in lastCfg, but I own it in currentCfg
-									// set shard status to SattusPulling and wait for migrateShards goroutine to pull it from other groups
-									kv.db[shardID].Status = StatusPulling
-
-								}
-							}
+							kv.DPrintf("INVALID config change operation, kv.currentCfg.Num: %v, newCfg.Num: %v\n", kv.currentCfg.Num, newCfg.Num)
 						}
 					}
 				case OpCommandOperation:
@@ -321,23 +324,40 @@ func (kv *ShardKV) handleApplyMsg() {
 						kv.DPrintf("internal DB operation\n")
 						args := op.Params.(CommandArgs)
 
-						// TODO: refactor
+						var sender *requestResultTransmitter
+						var hasClerkWaiting bool
+						if entryVal, ok := kv.requestMap.Load(applyMsg.CommandIndex); ok {
+							if transmitter, okk := entryVal.(requestResultTransmitter); okk && transmitter.clerkID == args.ClerkID && transmitter.requestID == args.RequestID {
+								sender = &transmitter
+								hasClerkWaiting = true
+							}
+						}
+
 						// config change happen, this shard is no longer mine, do not execute
 						if keyShardID := key2shard(args.Key); !kv.couldServe(keyShardID) {
-
 							// return ErrWrongGroup to waiting clerk (if any)
-							if entryVal, ok := kv.requestMap.Load(applyMsg.CommandIndex); ok {
-								if sender, okk := entryVal.(requestResultTransmitter); okk && sender.clerkID == args.ClerkID && sender.requestID == args.RequestID {
-									sender.resultCh <- applyResult{
-										Err: ErrWrongGroup,
-									}
+							if hasClerkWaiting {
+								sender.resultCh <- applyResult{
+									Err: ErrWrongGroup,
 								}
 							}
 						} else {
 							// check and apply command
-							val, err := kv.applyCommand(&args)
-							if entryVal, ok := kv.requestMap.Load(applyMsg.CommandIndex); ok {
-								if sender, ok := entryVal.(requestResultTransmitter); ok && sender.clerkID == args.ClerkID && sender.requestID == args.RequestID {
+							if prevRequestInfo, ok := kv.db[keyShardID].DupMap[args.ClerkID]; !ok || args.RequestID > prevRequestInfo.RequestID {
+
+								val, err := kv.applyCommand(&args)
+
+								// update duplicated map
+								kv.db[keyShardID].DupMap[args.ClerkID] = requestInfo{
+									RequestID: args.RequestID,
+									ApplyResult: applyResult{
+										Value: val,
+										Err:   err,
+									},
+								}
+
+								// tranfer apply result back to waiting clerk (if any)
+								if hasClerkWaiting {
 									sender.resultCh <- applyResult{
 										Value: val,
 										Err:   err,
@@ -349,9 +369,9 @@ func (kv *ShardKV) handleApplyMsg() {
 				case OpShardMigration:
 					{
 						pulledShards := op.Params.(PullShardReply)
-						// kv.DPrintf("DEBUG pulledShards: %v\n", pulledShards)
+						// filter unreliable duplicated pulled shards in previous config
 						if pulledShards.Num == kv.currentCfg.Num {
-							kv.DPrintf("shard transfer operation, config Num: %v\n", pulledShards.Num)
+							kv.DPrintf("migrate shards operation, config Num: %v\n", pulledShards.Num)
 
 							// pulledShards is from raft's logs and presister
 							// can not reference to it
@@ -386,9 +406,11 @@ func (kv *ShardKV) handleApplyMsg() {
 
 			kv.mu.Lock()
 			kv.applySnapshot(applyMsg.Snapshot)
+			// TODO: consider store lastCfg in snapshot or do a query
+			// lastCfg := kv.mck.Query(kv.currentCfg.Num - 1)
+			// kv.lastCfg = &lastCfg
+			kv.DPrintf("read and apply snapshot success, kv.currentCfg: %v\n", kv.currentCfg)
 			kv.mu.Unlock()
-
-			kv.DPrintf("read and apply snapshot success\n")
 		}
 	}
 }
@@ -412,6 +434,7 @@ func (kv *ShardKV) applyCommand(args *CommandArgs) (string, Err) {
 type KVSnapshot struct {
 	DB         map[int]*ShardDB
 	CurrentCfg shardctrler.Config
+	LastCfg    shardctrler.Config
 }
 
 // expect the caller to hold the lock
@@ -424,6 +447,7 @@ func (kv *ShardKV) generateSnapshot() []byte {
 	snapshot := KVSnapshot{
 		DB:         kv.db,
 		CurrentCfg: *kv.currentCfg,
+		LastCfg:    *kv.lastCfg,
 	}
 
 	if err := e.Encode(snapshot); err != nil {
@@ -448,6 +472,7 @@ func (kv *ShardKV) applySnapshot(snapshotBytes []byte) {
 		// so we can reference to it safely
 		kv.db = snapshot.DB
 		kv.currentCfg = &snapshot.CurrentCfg
+		kv.lastCfg = &snapshot.LastCfg
 	}
 }
 
@@ -481,15 +506,13 @@ func (kv *ShardKV) queryConfig() {
 
 	if couldQueryNewCfg {
 		if newCfg := kv.mck.Query(myCurrentCfgNum + 1); newCfg.Num == myCurrentCfgNum+1 {
-			kv.DPrintf("new config found, prepare to: %v\n", newCfg)
 
 			// commit a configuration log once there is new config
-			kv.rf.Start(
-				Op{
-					Type:   OpConfiguration,
-					Params: newCfg,
-				},
-			)
+			index, _, _ := kv.rf.Start(Op{
+				Type:   OpConfiguration,
+				Params: newCfg,
+			})
+			kv.DPrintf("new config found, config [%v]: %v, sync config through raft begin, applyIndex: %v\n", newCfg.Num, newCfg, index)
 		}
 	}
 }
@@ -501,7 +524,7 @@ func (kv *ShardKV) PullShard(args *PullShardArgs, reply *PullShardReply) {
 		return
 	}
 
-	kv.DPrintf("recieve PullShard request in config Num: %v for shards: %v\n", args.Num, args.ShardIDs)
+	kv.DPrintf("receive PullShard request in config Num: %v for shards: %v\n", args.Num, args.ShardIDs)
 	kv.mu.RLock()
 	defer kv.mu.RUnlock()
 
@@ -513,7 +536,7 @@ func (kv *ShardKV) PullShard(args *PullShardArgs, reply *PullShardReply) {
 	}
 
 	reply.ShardDBs = map[int]ShardDB{}
-	for shardID := range args.ShardIDs {
+	for _, shardID := range args.ShardIDs {
 		reply.ShardDBs[shardID] = *(kv.db[shardID].deepCopy())
 	}
 
@@ -531,6 +554,7 @@ func (kv *ShardKV) migrateShards() {
 	for shardID := range kv.currentCfg.Shards {
 		if kv.db[shardID].Status == StatusPulling {
 			lastGID := kv.lastCfg.Shards[shardID]
+			kv.DPrintf("for pulling shard: %v, lastGID: %v\n", shardID, lastGID)
 			if shards, ok := gid2ShardIDs[lastGID]; ok {
 				shards = append(shards, shardID)
 				gid2ShardIDs[lastGID] = shards
@@ -540,29 +564,33 @@ func (kv *ShardKV) migrateShards() {
 		}
 	}
 
+	// TODO: still has some bugs when the network is unreliable
 	var wg sync.WaitGroup
 	for gid, inShardIDs := range gid2ShardIDs {
 		wg.Add(1)
 		kv.DPrintf("begin PullShard RPC for shards: %v from GID: %v in config Num: %v\n", inShardIDs, gid, kv.currentCfg.Num)
-		go func(servers []string, configNum int, shardIDs []int) {
+		go func(gid int, servers []string, configNum int, shardIDs []int) {
 			defer wg.Done()
 
 			args := PullShardArgs{
 				Num:      configNum,
 				ShardIDs: shardIDs,
 			}
-			for _, server := range servers {
+			for i := range servers {
 				var reply PullShardReply
-				if ok := kv.make_end(server).Call("ShardKV.PullShard", &args, &reply); ok && reply.Err == OK {
-					kv.DPrintf("receive PullShard RPC reply, get shards: %v in configNum: %v\n", shardIDs, configNum)
-					kv.DPrintf("DEBUG pulledShards: %v\n", reply)
-					kv.rf.Start(Op{
+				if ok := kv.make_end(servers[i]).Call("ShardKV.PullShard", &args, &reply); ok && reply.Err == OK {
+					// kv.DPrintf("DEBUG pulledShards: %v\n", reply)
+					index, _, _ := kv.rf.Start(Op{
 						Type:   OpShardMigration,
 						Params: reply,
 					})
+					kv.DPrintf("receive PullShard response from GID: %v, server: %v, get shards: %v in configNum: %v, applyIndex: %v\n", gid, i, shardIDs, configNum, index)
+					return
+				} else {
+					kv.DPrintf("PullShard request to GID: %v, server: %v fail\n", gid, i)
 				}
 			}
-		}(kv.lastCfg.Groups[gid], kv.currentCfg.Num, inShardIDs)
+		}(gid, kv.lastCfg.Groups[gid], kv.currentCfg.Num, inShardIDs)
 	}
 
 	kv.mu.RUnlock()
@@ -648,6 +676,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.currentCfg = &shardctrler.Config{
 		Groups: map[int][]string{},
 	}
+	kv.lastCfg = kv.currentCfg
+
 	for shardID := range kv.currentCfg.Shards {
 		kv.db[shardID] = &ShardDB{
 			Status: StatusInvalid,
