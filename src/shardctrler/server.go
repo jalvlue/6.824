@@ -116,13 +116,13 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 
 	if _, isLeader := sc.rf.GetState(); !isLeader {
 		reply.Err = ErrWrongLeader
-		sc.DPrintf("I am not leader, return with ErrWrongLeader\n")
+		// sc.DPrintf("I am not leader, return with ErrWrongLeader\n")
 		return
 	}
 
 	// for debug
-	gids := mapToSlice(args.Servers)
-	sc.DPrintf("receive Join RPC from clerk [%v], args.RequestID: \"%v\", args.Gids: %v\n", args.ClerkID, args.RequestID, gids)
+	// gids := mapToSlice(args.Servers)
+	// sc.DPrintf("receive Join RPC from clerk [%v], args.RequestID: \"%v\", args.Gids: %v\n", args.ClerkID, args.RequestID, gids)
 
 	// check duplication
 	sc.mu.RLock()
@@ -132,7 +132,7 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 
 		reply.Err = OK
 
-		sc.DPrintf("requestID: \"%v\" has been executed\n")
+		// sc.DPrintf("requestID: \"%v\" has been executed\n")
 		return
 	}
 	sc.mu.RUnlock()
@@ -157,7 +157,7 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	}
 	sc.mu.Unlock()
 
-	sc.DPrintf("raft agreement start, applyIndex: {%d}\n", index)
+	// sc.DPrintf("raft agreement start, applyIndex: {%d}\n", index)
 
 	receiver := requestResultTransmitter{
 		clerkID:   args.ClerkID,
@@ -174,14 +174,14 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 
 			reply.Err = OK
 
-			sc.DPrintf("raft agreement finish\n")
+			// sc.DPrintf("raft agreement finish\n")
 		}
 	case <-time.After(CLERK_WAITING_TIMEOUT):
 		{
 			sc.requestMap.Delete(index)
 
 			reply.Err = ErrRepTimeout
-			sc.DPrintf("leader reply timeout, request fail\n")
+			// sc.DPrintf("leader reply timeout, request fail\n")
 
 			sc.mu.Lock()
 			sc.consumeCount += 1
@@ -195,11 +195,11 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 
 	if _, isLeader := sc.rf.GetState(); !isLeader {
 		reply.Err = ErrWrongLeader
-		sc.DPrintf("I am not leader, return with ErrWrongLeader\n")
+		// sc.DPrintf("I am not leader, return with ErrWrongLeader\n")
 		return
 	}
 
-	sc.DPrintf("receive Leave RPC from clerk [%v], args.RequestID: \"%v\", args.Gids: %v\n", args.ClerkID, args.RequestID, args.GIDs)
+	// sc.DPrintf("receive Leave RPC from clerk [%v], args.RequestID: \"%v\", args.Gids: %v\n", args.ClerkID, args.RequestID, args.GIDs)
 
 	sc.mu.RLock()
 	prevRequestInfo, ok := sc.clerkPrevRequestInfo[args.ClerkID]
@@ -208,7 +208,7 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 
 		reply.Err = OK
 
-		sc.DPrintf("requestID: \"%v\" has been executed\n", args.RequestID)
+		// sc.DPrintf("requestID: \"%v\" has been executed\n", args.RequestID)
 		return
 	}
 	sc.mu.RUnlock()
@@ -230,7 +230,7 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	}
 	sc.mu.Unlock()
 
-	sc.DPrintf("raft agreement start, applyIndex: {%d}\n", index)
+	// sc.DPrintf("raft agreement start, applyIndex: {%d}\n", index)
 
 	receiver := requestResultTransmitter{
 		clerkID:   args.ClerkID,
@@ -246,13 +246,13 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 
 			reply.Err = OK
 
-			sc.DPrintf("raft agreement finish\n")
+			// sc.DPrintf("raft agreement finish\n")
 		}
 	case <-time.After(CLERK_WAITING_TIMEOUT):
 		{
 			sc.requestMap.Delete(index)
 			reply.Err = ErrRepTimeout
-			sc.DPrintf("leader reply timeout, request fail\n")
+			// sc.DPrintf("leader reply timeout, request fail\n")
 
 			sc.mu.Lock()
 			sc.consumeCount += 1
@@ -266,11 +266,11 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 
 	if _, isLeader := sc.rf.GetState(); !isLeader {
 		reply.Err = ErrWrongLeader
-		sc.DPrintf("I am not leader, return with ErrWrongLeader\n")
+		// sc.DPrintf("I am not leader, return with ErrWrongLeader\n")
 		return
 	}
 
-	sc.DPrintf("receive Move RPC from clerk [%v], args.RequestID: \"%v\", args.GID: %v, args.Shard: %v\n", args.ClerkID, args.RequestID, args.GID, args.Shard)
+	// sc.DPrintf("receive Move RPC from clerk [%v], args.RequestID: \"%v\", args.GID: %v, args.Shard: %v\n", args.ClerkID, args.RequestID, args.GID, args.Shard)
 
 	sc.mu.RLock()
 	prevRequestInfo, ok := sc.clerkPrevRequestInfo[args.ClerkID]
@@ -279,7 +279,7 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 
 		reply.Err = OK
 
-		sc.DPrintf("requestID: \"%v\" has been executed\n")
+		// sc.DPrintf("requestID: \"%v\" has been executed\n")
 		return
 	}
 	sc.mu.RUnlock()
@@ -302,7 +302,7 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 	}
 	sc.mu.Unlock()
 
-	sc.DPrintf("raft agreement start, applyIndex: {%d}\n", index)
+	// sc.DPrintf("raft agreement start, applyIndex: {%d}\n", index)
 
 	receiver := requestResultTransmitter{
 		clerkID:   args.ClerkID,
@@ -318,13 +318,13 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 
 			reply.Err = OK
 
-			sc.DPrintf("raft agreement finish\n")
+			// sc.DPrintf("raft agreement finish\n")
 		}
 	case <-time.After(CLERK_WAITING_TIMEOUT):
 		{
 			sc.requestMap.Delete(index)
 			reply.Err = ErrRepTimeout
-			sc.DPrintf("leader reply timeout, request fail\n")
+			// sc.DPrintf("leader reply timeout, request fail\n")
 
 			sc.mu.Lock()
 			sc.consumeCount += 1
@@ -338,11 +338,11 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 
 	if _, isLeader := sc.rf.GetState(); !isLeader {
 		reply.Err = ErrWrongLeader
-		sc.DPrintf("I am not leader, return with ErrWrongLeader\n")
+		// sc.DPrintf("I am not leader, return with ErrWrongLeader\n")
 		return
 	}
 
-	sc.DPrintf("receive Query RPC from clerk [%v], args.RequestID: \"%v\", args.Num: %v\n", args.ClerkID, args.RequestID, args.Num)
+	// sc.DPrintf("receive Query RPC from clerk [%v], args.RequestID: \"%v\", args.Num: %v\n", args.ClerkID, args.RequestID, args.Num)
 
 	sc.mu.RLock()
 	prevRequestInfo, ok := sc.clerkPrevRequestInfo[args.ClerkID]
@@ -352,7 +352,7 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 		reply.Err = OK
 		reply.Config = prevRequestInfo.Result.(Config)
 
-		sc.DPrintf("requestID: \"%v\" has been executed\n", args.RequestID)
+		// sc.DPrintf("requestID: \"%v\" has been executed\n", args.RequestID)
 		return
 	}
 	sc.mu.RUnlock()
@@ -375,7 +375,7 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	}
 	sc.mu.Unlock()
 
-	sc.DPrintf("raft agreement start, applyIndex: {%d}\n", index)
+	// sc.DPrintf("raft agreement start, applyIndex: {%d}\n", index)
 
 	receiver := requestResultTransmitter{
 		clerkID:   args.ClerkID,
@@ -392,14 +392,14 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 			reply.Err = OK
 			reply.Config = res.(Config)
 
-			sc.DPrintf("raft agreement finish\n")
+			// sc.DPrintf("raft agreement finish\n")
 		}
 	case <-time.After(CLERK_WAITING_TIMEOUT):
 		{
 			sc.requestMap.Delete(index)
 
 			reply.Err = ErrRepTimeout
-			sc.DPrintf("leader reply timeout, request fail\n")
+			// sc.DPrintf("leader reply timeout, request fail\n")
 
 			sc.mu.Lock()
 			sc.consumeCount += 1
@@ -415,7 +415,7 @@ func (sc *ShardCtrler) handleApplyMsg() {
 		{
 			if applyMsg.CommandValid {
 				// command msg
-				sc.DPrintf("receive command commit applyMsg, applyMsg.CommandIndex: %d\n", applyMsg.CommandIndex)
+				// sc.DPrintf("receive command commit applyMsg, applyMsg.CommandIndex: %d\n", applyMsg.CommandIndex)
 
 				sc.mu.Lock()
 				if op, ok := applyMsg.Command.(Op); ok {
@@ -461,7 +461,7 @@ func (sc *ShardCtrler) reassignGroupJoin(shards *[NShards]int, newGroups, oldGro
 
 	// first boot without joined groups
 	if numOldGroups == 0 {
-		sc.DPrintf("first boot without joined groups")
+		// sc.DPrintf("first boot without joined groups")
 		for index := 0; index < NShards; index++ {
 			newGID := newGroups[index%numNewGroup]
 			shards[index] = newGID
@@ -488,14 +488,14 @@ func (sc *ShardCtrler) reassignGroupJoin(shards *[NShards]int, newGroups, oldGro
 
 	index := -1
 	for _, oldGID := range oldGroups {
-		sc.DPrintf("balancing oldGID: %d, groupLoad: %v\n", oldGID, sc.groupLoads[oldGID])
+		// sc.DPrintf("balancing oldGID: %d, groupLoad: %v\n", oldGID, sc.groupLoads[oldGID])
 		for needToMove(sc.groupLoads[oldGID], availableGroupAverageLoad) {
 
 			// new groups accept loads in a round turn for balanced load
 			index += 1
 			newGID := newGroups[index%numNewGroup]
 			moveOneShardTo(shards, oldGID, newGID)
-			sc.DPrintf("move one shard of oldGID: [%v] to newGID [%v]\n", oldGID, newGID)
+			// sc.DPrintf("move one shard of oldGID: [%v] to newGID [%v]\n", oldGID, newGID)
 
 			sc.groupLoads[oldGID] -= 1
 			sc.groupLoads[newGID] += 1
@@ -506,13 +506,13 @@ func (sc *ShardCtrler) reassignGroupJoin(shards *[NShards]int, newGroups, oldGro
 		numAvailableGroups -= 1
 		availableGroupAverageLoad = shardTasks / numAvailableGroups
 
-		sc.DPrintf("shardTasks: %v, numAvailableGroups: %v, availableGroupAverageLoad: %v, sc.groupLoad[oldGID] = %v\n", shardTasks, numAvailableGroups, availableGroupAverageLoad, sc.groupLoads[oldGID])
+		// sc.DPrintf("shardTasks: %v, numAvailableGroups: %v, availableGroupAverageLoad: %v, sc.groupLoad[oldGID] = %v\n", shardTasks, numAvailableGroups, availableGroupAverageLoad, sc.groupLoads[oldGID])
 	}
 }
 
 // reassign shards for balanced load when leaveGroups leave
 func (sc *ShardCtrler) reassignGroupsLeave(shards *[NShards]int, leaveGroups, remainGroups []int) {
-	sc.DPrintf("leaveGroup: %v, remainGroup: %v\n", leaveGroups, remainGroups)
+	// sc.DPrintf("leaveGroup: %v, remainGroup: %v\n", leaveGroups, remainGroups)
 
 	numRemainGroups := len(remainGroups)
 	if numRemainGroups == 0 {
@@ -543,12 +543,12 @@ func (sc *ShardCtrler) reassignGroupsLeave(shards *[NShards]int, leaveGroups, re
 
 		// reassign leaveGroup's loads to remainGroups
 		leaveLoad := sc.groupLoads[leaveGID]
-		sc.DPrintf("leaveGID: %v, leaveLoad: %v\n", leaveGID, leaveLoad)
+		// sc.DPrintf("leaveGID: %v, leaveLoad: %v\n", leaveGID, leaveLoad)
 		for i := 0; i < leaveLoad; i++ {
 			index += 1
 			remainGID := remainGroups[index%numRemainGroups]
 			moveOneShardTo(shards, leaveGID, remainGID)
-			sc.DPrintf("move one shard of leaveGID: [%v] to remainGID [%v]\n", leaveGID, remainGID)
+			// sc.DPrintf("move one shard of leaveGID: [%v] to remainGID [%v]\n", leaveGID, remainGID)
 			sc.groupLoads[remainGID] += 1
 		}
 
@@ -560,7 +560,7 @@ func (sc *ShardCtrler) reassignGroupsLeave(shards *[NShards]int, leaveGroups, re
 // expect the caller to hold the lock
 // apply commands from applyCh sent by raft component
 func (sc *ShardCtrler) applyCommand(applyMsg *raft.ApplyMsg, op *Op) interface{} {
-	sc.DPrintf("apply command commit applyMsg, applyMsg.Index: %d, applyMsg.Op: %v", applyMsg.CommandIndex, op)
+	// sc.DPrintf("apply command commit applyMsg, applyMsg.Index: %d, applyMsg.Op: %v", applyMsg.CommandIndex, op)
 
 	if op.Type == OpJoin {
 
@@ -576,7 +576,7 @@ func (sc *ShardCtrler) applyCommand(applyMsg *raft.ApplyMsg, op *Op) interface{}
 			cfg.Groups[k] = v
 		}
 
-		sc.DPrintf("new config apply, config Num: %v, config Shards: %v, config Groups: %v\n", cfg.Num, cfg.Shards, mapToSlice(cfg.Groups))
+		// sc.DPrintf("new config apply, config Num: %v, config Shards: %v, config Groups: %v\n", cfg.Num, cfg.Shards, mapToSlice(cfg.Groups))
 		sc.configs = append(sc.configs, cfg)
 		return nil
 
@@ -591,7 +591,7 @@ func (sc *ShardCtrler) applyCommand(applyMsg *raft.ApplyMsg, op *Op) interface{}
 		}
 
 		sc.reassignGroupsLeave(&cfg.Shards, leaveGroups, mapToSlice(cfg.Groups))
-		sc.DPrintf("new config apply, config Num: %v, config Shards: %v, config Groups: %v\n", cfg.Num, cfg.Shards, mapToSlice(cfg.Groups))
+		// sc.DPrintf("new config apply, config Num: %v, config Shards: %v, config Groups: %v\n", cfg.Num, cfg.Shards, mapToSlice(cfg.Groups))
 
 		sc.configs = append(sc.configs, cfg)
 		return nil
@@ -610,7 +610,7 @@ func (sc *ShardCtrler) applyCommand(applyMsg *raft.ApplyMsg, op *Op) interface{}
 		cfg.Shards[shard] = newGID
 		sc.groupLoads[newGID] += 1
 
-		sc.DPrintf("new config apply, config Num: %v, config Shards: %v, config Groups: %v\n", cfg.Num, cfg.Shards, mapToSlice(cfg.Groups))
+		// sc.DPrintf("new config apply, config Num: %v, config Shards: %v, config Groups: %v\n", cfg.Num, cfg.Shards, mapToSlice(cfg.Groups))
 		sc.configs = append(sc.configs, cfg)
 
 		return nil
@@ -670,6 +670,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sc.groupLoads = map[int]int{}
 
 	go sc.handleApplyMsg()
+
+	sc.DPrintf("started\n")
 
 	return sc
 }

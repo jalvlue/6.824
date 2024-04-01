@@ -79,6 +79,15 @@ type CommandReply struct {
 	Value string
 }
 
+type EliminateShardArgs struct {
+	Num      int
+	ShardIDs []int
+}
+
+type EliminateShardReply struct {
+	Err Err
+}
+
 // command op from client, Get, Put and Append
 type commandOperation uint8
 
@@ -95,5 +104,5 @@ const (
 	StatusServing shardStatus = iota
 	StatusPulling
 	StatusBePulling
-	StatusInvalid
+	StatusEliminated
 )
