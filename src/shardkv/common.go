@@ -14,6 +14,9 @@ const (
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongGroup  = "ErrWrongGroup"
 	ErrWrongLeader = "ErrWrongLeader"
+	ErrRepTimeout  = "ErrRepTimeout"
+	ErrDefault     = ""
+	ErrWrongNum    = "ErrWrongNum"
 )
 
 type Err string
@@ -27,6 +30,9 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+
+	ClerkID   int64
+	RequestID int64
 }
 
 type PutAppendReply struct {
@@ -36,9 +42,67 @@ type PutAppendReply struct {
 type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
+
+	ClerkID   int64
+	RequestID int64
 }
 
 type GetReply struct {
 	Err   Err
 	Value string
 }
+
+type PullShardArgs struct {
+	Num      int
+	ShardIDs []int
+}
+
+type PullShardReply struct {
+	Err Err
+	Num int
+
+	// mapping: inShardID -> shardDB
+	ShardDBs map[int]ShardDB
+}
+
+// more general command args, takes care of all Get, Put and Append client command requests
+type CommandArgs struct {
+	Key       string
+	Value     string
+	CommandOp commandOperation
+	ClerkID   int64
+	RequestID int64
+}
+
+type CommandReply struct {
+	Err   Err
+	Value string
+}
+
+type EliminateShardArgs struct {
+	Num      int
+	ShardIDs []int
+}
+
+type EliminateShardReply struct {
+	Err Err
+}
+
+// command op from client, Get, Put and Append
+type commandOperation uint8
+
+const (
+	CommandGet commandOperation = iota
+	CommandPut
+	CommandAppend
+)
+
+// shard status
+type shardStatus uint8
+
+const (
+	StatusServing shardStatus = iota
+	StatusPulling
+	StatusBePulling
+	StatusEliminated
+)
